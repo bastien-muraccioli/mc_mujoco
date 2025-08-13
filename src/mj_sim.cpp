@@ -766,7 +766,8 @@ void MjRobot::sendControl(const mjModel & model,
                           size_t interp_idx,
                           size_t frameskip_,
                           bool torque_control,
-                          bool disturbance)
+                          bool disturbance,
+                          bool PD_interpolation)
 {
   for(size_t i = 0; i < mj_ctrl.size(); ++i)
   {
@@ -778,12 +779,17 @@ void MjRobot::sendControl(const mjModel & model,
     {
       continue;
     }
+    double q_ref = mj_next_ctrl_q[i];
+    double alpha_ref = mj_next_ctrl_alpha[i];
     // compute desired q using interpolation
-    double q_ref = (interp_idx + 1) * (mj_next_ctrl_q[i] - mj_prev_ctrl_q[i]) / frameskip_;
-    q_ref += mj_prev_ctrl_q[i];
-    // compute desired alpha using interpolation
-    double alpha_ref = (interp_idx + 1) * (mj_next_ctrl_alpha[i] - mj_prev_ctrl_alpha[i]) / frameskip_;
-    alpha_ref += mj_prev_ctrl_alpha[i];
+    if(PD_interpolation)
+    {
+      q_ref = (interp_idx + 1) * (mj_next_ctrl_q[i] - mj_prev_ctrl_q[i]) / frameskip_;
+      q_ref += mj_prev_ctrl_q[i];
+      // compute desired alpha using interpolation
+      alpha_ref = (interp_idx + 1) * (mj_next_ctrl_alpha[i] - mj_prev_ctrl_alpha[i]) / frameskip_;
+      alpha_ref += mj_prev_ctrl_alpha[i];
+    }
     // compute desired jointTorque using interpolation
     double torque_ref = (interp_idx + 1) * (mj_next_ctrl_jointTorque[i] - mj_prev_ctrl_jointTorque[i]) / frameskip_;
     torque_ref += mj_prev_ctrl_jointTorque[i];
@@ -795,6 +801,8 @@ void MjRobot::sendControl(const mjModel & model,
       }
       else
       {
+        mc_rtc::log::info("[mc_mujoco] [i]; {}, q: {}, q_ref: {}, alpha: {}, alpha_ref: {}",
+                          i, encoders[rjo_id], q_ref, alphas[rjo_id], alpha_ref);
         mj_ctrl[i] = PD(rjo_id, q_ref, encoders[rjo_id], alpha_ref, alphas[rjo_id]);
       }
       double ratio = model.actuator_gear[6 * mot_id];
@@ -832,10 +840,14 @@ bool MjSimImpl::controlStep()
   if(controller->controller().datastore().has("ControlMode"))
     use_torque = controller->controller().datastore().get<std::string>("ControlMode").compare("Torque") == 0;
 
+  bool PD_interpolation = true;
+  if(controller->controller().datastore().has("PDInterpolation"))
+    PD_interpolation = controller->controller().datastore().get<bool>("PDInterpolation");
+
   // On each control iter
   for(auto & r : robots)
   {
-    r.sendControl(*model, *data, interp_idx, frameskip_, use_torque, config.with_disturbance);
+    r.sendControl(*model, *data, interp_idx, frameskip_, use_torque, config.with_disturbance, PD_interpolation);
   }
   iterCount_++;
   return false;
