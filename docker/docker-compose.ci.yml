@@ -1,0 +1,6 @@
+services:
+  mc-mujoco-ci:
+    image: mc-rtc-mujoco:latest
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
