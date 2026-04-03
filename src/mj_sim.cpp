@@ -4,6 +4,7 @@
 #include <cassert>
 #include <chrono>
 #include <type_traits>
+#include <unordered_set>
 
 #include "MujocoClient.h"
 #include "config.h"
@@ -381,6 +382,14 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
   const auto & mbc = robot.mbc();
   const auto & rjo = robot.module().ref_joint_order();
   if(rjo.size() != mj_jnt_names.size())
+  std::unordered_set<std::string> gripper_active_joints;
+  for(const auto & g : robot.grippers())
+  {
+    for(const auto & joint : g.get().activeJoints())
+    {
+      gripper_active_joints.insert(joint);
+    }
+  }
   {
     mc_rtc::log::error_and_throw<std::runtime_error>(
         "[mc_mujoco] Missmatch in model for {}, reference joint order has {} joints but MuJoCo models has {} joints",
@@ -400,6 +409,7 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
     const auto & jn = [&]()
     {
       if(!prefix.empty())
+  mj_is_gripper_joint.resize(0);
       {
         return mj_jn.substr(prefix.size() + 1);
       }
@@ -425,6 +435,7 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
       mj_prev_ctrl_alpha.push_back(robot.mbc().alpha[jIndex][0]);
       mj_prev_ctrl_jointTorque.push_back(robot.mbc().jointTorque[jIndex][0]);
       if(rjo_idx != -1)
+      mj_is_gripper_joint.push_back(gripper_active_joints.count(jn) != 0);
       {
         encoders[rjo_idx] = mj_prev_ctrl_q.back();
         alphas[rjo_idx] = mj_prev_ctrl_alpha.back();
@@ -444,6 +455,7 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
   // reset the PD gains to default values
   kp = default_kp;
   kd = default_kd;
+      mj_is_gripper_joint.push_back(false);
 }
 
 template<typename T>
@@ -822,7 +834,7 @@ void MjRobot::sendControl(const mjModel & model,
     torque_ref += mj_prev_ctrl_jointTorque[i];
     if(mot_id != -1)
     {
-      if(torque_control)
+      if(torque_control && !mj_is_gripper_joint[i])
       {
         mj_ctrl[i] = torque_ref;
       }
