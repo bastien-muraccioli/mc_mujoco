@@ -39,7 +39,7 @@ jobs:
         compiler: ${{ matrix.compiler }}
         build-type: ${{ matrix.build-type }}
         ubuntu: |
-          apt: libmc-rtc-dev libxi-dev libxcursor-dev libxkbcommon-dev libxinerama-dev libxrandr-dev libglew-dev libboost-program-options-dev ros-humble-ament-index-cpp
+          apt: libmc-rtc-dev libxi-dev libxcursor-dev libxkbcommon-dev libxinerama-dev libxrandr-dev libglew-dev libboost-program-options-dev libzmq3-dev ros-humble-ament-index-cpp
           apt-mirrors:
             mc-rtc:
               cloudsmith: mc-rtc/head
@@ -75,7 +75,7 @@ jobs:
       with:
         compiler: ${{ matrix.compiler }}
         build-type: ${{ matrix.build-type }}
-        options: -DMUJOCO_ROOT_DIR="${{ env.MUJOCO_ROOT_DIR }}" -DBUILD_EXAMPLES=OFF
+        options: -DMUJOCO_ROOT_DIR="${{ env.MUJOCO_ROOT_DIR }}"
     - name: Check usage
       shell: bash
       run: |

@@ -1,16 +1,43 @@
-# mujoco interface for mc-rtc
+# mc_mujoco — URLab bridge for mc-rtc
 
-![Screenshot from 2022-08-12 17-09-16](https://user-images.githubusercontent.com/16384313/188832982-1a1263e4-ce33-4dc7-804a-589d151670b3.png)
+`mc_mujoco` runs an [mc_rtc](https://github.com/jrl-umi3218/mc_rtc) controller against physics simulated
+by [MuJoCo](https://mujoco.org/) inside [Unreal Engine](https://www.unrealengine.com/), via
+[URLab](https://github.com/URLab-Sim/UnrealRoboticsLab). mc_mujoco does not run a local MuJoCo simulation
+and does not render a 3D scene: physics is stepped and rendered entirely on the URLab/Unreal side.
+mc_mujoco connects to URLab's ZMQ RPC bridge, retrieves the compiled MuJoCo model, computes control with
+mc_rtc, and sends actuator commands back every physics step. A small mc_rtc GUI window (2D ImGui panel:
+forms, plots, the controller tree) runs alongside the Unreal window.
+
+```
+┌──────────────────────────┐        ZMQ RPC (msgpack)        ┌───────────────────────────┐
+│  Unreal Engine + URLab    │ <------------------------------> │  mc_mujoco                 │
+│  - steps MuJoCo physics   │   hello / step / reset           │  - mc_rtc controller       │
+│  - renders robot + scene  │   per-articulation qpos/qvel/    │  - PD or torque control    │
+│                            │   sensors out, ctrl_map in       │  - mc_rtc GUI (2D panel)   │
+└──────────────────────────┘                                   └───────────────────────────┘
+```
+
+## Requirements
+
+- A running URLab session (Unreal Editor with the URLab plugin, in Play-In-Editor or ready to enter it)
+  exposing its ZMQ RPC bridge — see [URLab-Sim/UnrealRoboticsLab](https://github.com/URLab-Sim/UnrealRoboticsLab).
+- Each mc_rtc robot you intend to control must correspond to a URLab articulation whose **prefix matches
+  the mc_rtc robot module name** (mc_mujoco's historical MJCF-naming convention). PD gains are still
+  configured locally — see [Configuration](#configuration) below — the model geometry itself is no
+  longer read from disk by mc_mujoco.
+- Linux only.
 
 ## Usage
 
-First, install the required apt packages:
+Install the required apt packages:
 
 ```sh
-$ sudo apt install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libglew-dev
+$ sudo apt install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libglew-dev libzmq3-dev
 ```
 
-Then, execute the following command to install mujoco (`$HOME/.mujoco/mujoco301`), and build `mc_mujoco`:
+Then build `mc_mujoco` (this also downloads MuJoCo to `$HOME/.mujoco/mujoco<version>` if
+`MUJOCO_ROOT_DIR` isn't provided — the local MuJoCo install is used only to load the model URLab provides
+and recompute kinematics, never to step physics):
 
 ```sh
 $ git clone --recursive git@github.com:rohanpsingh/mc_mujoco.git
@@ -21,23 +48,35 @@ $ make
 $ make install
 ```
 
-If mujoco is already installed, you can add the following   option to specify the path :
+`libzmq`/`cppzmq`/`msgpack-c` are fetched from source automatically if not found as system packages (see
+`src/CMakeLists.txt`); install `libzmq3-dev`, `cppzmq-dev`, and `libmsgpack-cxx-dev` beforehand to skip
+that.
+
+Add the following line to your `~/.bashrc` if MuJoCo was auto-downloaded:
+
+```
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco<version>/lib:${HOME}/.mujoco/mujoco<version>/bin
+```
+
+With a URLab session running (or ready to enter Play-In-Editor) and listening on its ZMQ bridge, run:
 
 ```sh
-$ cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMUJOCO_ROOT_DIR=$HOME/.mujoco/mujoco301
+$ mc_mujoco --urlab-endpoint tcp://localhost:5559
 ```
 
-Add the following line to your `~/.bashrc`:
+### CLI options
 
-```
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco301/lib:${HOME}/.mujoco/mujoco301/bin
-```
-
-Then, to run the interface:
-
-```sh
-$ mc_mujoco
-```
+| Flag                       | Description                                                                 |
+| --------------------------- | ---------------------------------------------------------------------------- |
+| `-f, --mc-config`           | Configuration file passed to mc_rtc                                          |
+| `--urlab-endpoint`          | URLab ZMQ RPC endpoint (default `tcp://localhost:5559`)                      |
+| `--urlab-timeout-ms`        | Timeout for a single URLab RPC round-trip (default 6000)                     |
+| `--urlab-pie-timeout-s`     | Timeout waiting for URLab to enter Play-In-Editor if not already running     |
+| `--step-by-step`            | Start paused, advance manually from the GUI                                  |
+| `--torque-control`          | Send raw torque commands instead of running mc_mujoco's local PD loop        |
+| `-s, --sync`                | Pace `step()` RPCs against wall-clock real time                              |
+| `--without-controller`      | Disable the mc_rtc controller (bridge connects but sends no control)         |
+| `--without-mc-rtc-gui`      | Disable the mc_rtc GUI window                                                |
 
 ## Docker
 
@@ -52,72 +91,29 @@ $ make run
 This builds the environment image, compiles mc_mujoco, and drops you into a shell. Then:
 
 ```sh
-$ mc_mujoco
+$ mc_mujoco --urlab-endpoint tcp://<urlab-host>:5559
 ```
 
-See [docker/README.md](docker/README.md) for details on development workflow, using the image for your own mc_rtc controllers, running CI locally, and version management.
+See [docker/README.md](docker/README.md) for details on development workflow and version management.
 
-## Examples
+## Configuration
 
-Example controllers live under [`examples/`](examples/). Not built by default (enable with `-DBUILD_EXAMPLES=ON`). See [`examples/README.md`](examples/README.md) for the convention and how to activate a sample's config inside the container.
-
-- **[neck_policy](examples/neck_policy/)** — Minimal libtorch NN policy that drives JVRC1's neck yaw joint. Good starting point for running NN policies in mc_mujoco.
-- **[grasp-fsm](examples/grasp-fsm/)** *(submodule)* — FSM controller that grasps an object on a table using BaselineWalkingController. Pulled from [grasp-fsm-sample-controller](https://github.com/rohanpsingh/grasp-fsm-sample-controller).
-
----
-
-#### To load additional objects in the scene
-
-There are several steps needed to be followed:
-
-- First, create your object's XML file under `mc_mujoco/robots`. For example, [longtable.xml](robots/longtable.xml)
-- Then, create a simple config file with the `xmlModelPath` attribute. For example, [longtable.in.yaml](robots/longtable.in.yaml)
-- Then, install your object by adding it to the end of `mc_mujoco/robots/CMakeLists.txt`. For example, add [setup_env_object(box object)](robots/CMakeLists.txt#L15)
-
-Your object is now created and installed. Next you want to tell `mc-mujoco` to load it and place it at the desired pose.
-Find `~/.config/mc_rtc/mc_mujoco/mc_mujoco.yaml` (create it manually if needed) and paste the following:
-
-```yaml
-objects:
-  box1:
-    module: "box"
-    init_pos:
-      translation: [3.1, 0, 0.9]
-      rotation: [0, 0, 0]
-  box2:
-    module: "box"
-    init_pos:
-      translation: [3.7, 0.2, 0.9]
-      rotation: [0, 0, 0]
-```
-
----
-
-#### To load MuJoCo plugins
-
-To load [MuJoCo plugins](https://mujoco.readthedocs.io/en/latest/programming/extension.html#engine-plugins), specify the paths to the directories containing the plugin libraries in the `PluginPaths` entry in `~/.config/mc_rtc/mc_mujoco/mc_mujoco.yaml`.
-
-```yaml
-PluginPaths: ["<path-to-plugins>"]
-```
-
----
-
-#### GUI: Mouse Interaction
-
-An object is selected by left-double-click. The user can then apply forces and torques on the selected object by holding `Ctrl` key and dragging the left-mouse-button for torques and right-mouse-button for forces.
+PD gains are still configured the way they always were: each robot's `<robot>.yaml` (searched under
+`~/.config/mc_rtc/mc_mujoco/` then the share install directory) may set `pdGainsPath` to a gains file.
+Model geometry, scene composition, and object placement are no longer configured here — they're authored
+in the Unreal/URLab level itself.
 
 ## Datastore callbacks
 
-The following callbacks are available for the controller when running inside `mc_mujoco`
+The following callbacks are available to the controller when running inside `mc_mujoco`:
 
-| Signature                                                                           | Description                                                                                                        |
-| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `{robot}::SetPosW(const sva::PTransformd &)`                                         | Set the position of the given `robot`. Also works with objects                                                     |
-| `{robot}::SetPDGains(const std::vector<double> & p, const std::vector<double> & d)` | Set the PD gains for the actuation of the given `robot`. `p` and `d` must follow the robot's reference joint order |
-| `{robot}::SetPDGainsByName(const std::string & jn, double p, double d)`             | Set the PD gains for a given joint `jn` in `robot`                                                                 |
-| `{robot}::GetPDGains(std::vector<double> & p, std::vector<double> & d)`             | Get the current PD gains for `robot` actuation                                                                     |
-| `{robot}::GetPDGainsByName(const std::string & jn, double & p, double & d)`         | Get the current PD gains for a given joint `jn` in `robot`                                                         |
+| Signature                                                                            | Description                                                                                                        |
+| ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `{robot}::SetPDGains(const std::vector<double> & p, const std::vector<double> & d)`  | Set the PD gains for the actuation of the given `robot`. `p` and `d` must follow the robot's reference joint order |
+| `{robot}::SetPDGainsByName(const std::string & jn, double p, double d)`              | Set the PD gains for a given joint `jn` in `robot`                                                                 |
+| `{robot}::GetPDGains(std::vector<double> & p, std::vector<double> & d)`              | Get the current PD gains for `robot` actuation                                                                     |
+| `{robot}::GetPDGainsByName(const std::string & jn, double & p, double & d)`          | Get the current PD gains for a given joint `jn` in `robot`                                                         |
+| `{robot}::SetPosW(const sva::PTransformd &)`                                          | **No-op.** Robot/object poses are authoritative in URLab; logs a one-time warning if called.                       |
 
 ## Citation
 
@@ -138,6 +134,8 @@ This package includes code from:
 
 - [imgui v1.84.2](https://github.com/ocornut/imgui/)
 - [implot v0.11](https://github.com/epezent/implot)
-- [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo)
 - [pugixml v1.11.4](https://github.com/zeux/pugixml)
 - [Roboto font](https://github.com/googlefonts/roboto)
+
+Physics simulation and rendering are provided by [URLab](https://github.com/URLab-Sim/UnrealRoboticsLab),
+not by this package.

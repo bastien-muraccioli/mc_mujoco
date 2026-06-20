@@ -11,34 +11,12 @@
 namespace mc_mujoco
 {
 
-/** Merge multiple mujoco models into one
- *
- * For each merged model a prefix is added to every named entities in the model
- *
- * Warnings are displayed when some global parameters conflict, in such cases, the value from the first model where the
- * parameter appeared will prevail
- *
- * \param mujocoObjects Objects added to the simulation but not in mc_rtc
- *
- * \param mcrtcObjects Objects added to the simulation and to mc_rtc
- *
- * \param mjObjects MuJoCo ids for objects not in mc_rtc will be filled with parameters in the merged model
- *
- * \param mjRobots MuJoCo ids for objects in mc_rtc will be filled with parameters in the merged model
- *
- * \returns The path to the generated model
- */
-std::string merge_mujoco_models(const std::map<std::string, std::string> & mujocoObjects,
-                                const std::map<std::string, std::string> & mcrtcObjects,
-                                std::vector<MjObject> & mjObjects,
-                                std::vector<MjRobot> & mjRobots);
+/*! Connect to URLab, perform the handshake (+ begin_pie if needed), load the resulting compiled model
+ * locally, and populate mj_sim->robots / mj_sim->objects from the handshake's articulations block
+ * matched against the mc_rtc controller's robots. */
+bool mujoco_init(MjSimImpl * mj_sim);
 
-/*! Load XML model and initialize */
-bool mujoco_init(MjSimImpl * mj_sim,
-                 const std::map<std::string, std::string> & mujocoObjects,
-                 const std::map<std::string, std::string> & mcrtcObjects);
-
-/*! Create GLFW window */
+/*! Create the GLFW window used for the mc_rtc GUI panel (2D ImGui only) */
 void mujoco_create_window(MjSimImpl * mj_sim);
 
 /** Returns a sensor id from name, -1 if the type does not match or the sensor does not exist */

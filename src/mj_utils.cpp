@@ -1,12 +1,6 @@
 #include "glfw3.h"
 #include "mujoco.h"
 
-#ifndef USE_UI_ADAPTER
-#  include "uitools.h"
-#else
-#  include "our_glfw_adapter.h"
-#endif
-
 #include "mj_utils.h"
 
 #include "config.h"
@@ -18,11 +12,13 @@
 
 #include "implot.h"
 
-#include "ImGuizmo.h"
-
 #include "Robot_Regular_ttf.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 namespace fs = std::filesystem;
 
 namespace mc_mujoco
@@ -33,319 +29,235 @@ namespace mc_mujoco
  ******************************************************************************/
 
 static bool glfw_initialized = false;
-static bool mujoco_initialized = false;
 
 /*******************************************************************************
- * Callbacks for GLFWwindow
+ * Callbacks for GLFWwindow (mc_rtc GUI panel only -- no 3D scene to interact with)
  ******************************************************************************/
 
-// set window layout
-void uiLayout(mjuiState * state)
+namespace
 {
-  auto mj_sim = static_cast<MjSimImpl *>(state->userdata);
 
-  mjrRect * rect = state->rect;
-  // set number of rectangles
-  state->nrect = 1;
-  // rect 0: entire framebuffer
-  rect[0].left = 0;
-  rect[0].bottom = 0;
-#ifdef USE_UI_ADAPTER
-  std::tie(rect[0].width, rect[0].height) = mj_sim->platform_ui_adapter->GetFramebufferSize();
-#else
-  glfwGetFramebufferSize(mj_sim->window, &rect[0].width, &rect[0].height);
-#endif
+void glfwKeyCallback(GLFWwindow * window, int key, int /*scancode*/, int action, int /*mods*/)
+{
+  auto mj_sim = static_cast<MjSimImpl *>(glfwGetWindowUserPointer(window));
+  if(!mj_sim || action != GLFW_PRESS)
+  {
+    return;
+  }
+  if(ImGui::GetIO().WantCaptureKeyboard)
+  {
+    return;
+  }
+  if(key == GLFW_KEY_SPACE)
+  {
+    mj_sim->config.step_by_step = !mj_sim->config.step_by_step;
+  }
+  if(key == GLFW_KEY_RIGHT && mj_sim->config.step_by_step)
+  {
+    mj_sim->rem_steps = 1;
+  }
 }
 
-// handle UI event
-void uiEvent(mjuiState * state)
+/** Write a binary blob to a temp file and return the path. Used to round-trip URLab's compiled mjb
+ * through mj_loadModel, which only reads from disk. */
+std::string write_temp_mjb(const std::string & mjb)
 {
-  auto mj_sim = static_cast<MjSimImpl *>(state->userdata);
+  auto path =
+      fs::temp_directory_path()
+      / fmt::format("mc_mujoco_urlab_{}.mjb", std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  std::ofstream out(path, std::ios::binary);
+  if(!out.is_open())
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] Failed to open temp file {} to write URLab model",
+                                                     path.string());
+  }
+  out.write(mjb.data(), static_cast<std::streamsize>(mjb.size()));
+  out.close();
+  return path.string();
+}
 
-  if(state->type == mjEVENT_KEY && ImGui::GetIO().WantCaptureKeyboard)
+/** Resolve a robot's reference-joint-order joint names and actuator names into the corresponding live
+ * MuJoCo names for a given articulation, using the handshake's original_names map (authored XML name ->
+ * live/possibly-renamed name) when available, falling back to "<prefix>_<name>" (mc_mujoco's historical
+ * naming convention, still used by mc_rtc robot modules' MJCF) otherwise. */
+struct ResolvedNames
+{
+  std::vector<std::string> joint_names; // live MuJoCo joint name per rjo entry, "" if not found
+  std::vector<std::string> actuator_names; // live MuJoCo actuator name per rjo entry, "" if no actuator
+};
+
+ResolvedNames resolve_names(const mjModel & model,
+                            const URLabArticulationInfo & art,
+                            const std::vector<std::string> & rjo)
+{
+  ResolvedNames out;
+  out.joint_names.resize(rjo.size());
+  out.actuator_names.resize(rjo.size());
+
+  auto joints_it = art.original_names.find("joints");
+  auto actuators_it = art.original_names.find("actuators");
+
+  // Build reverse maps: authored XML name -> live name (the handshake gives live -> original; we want
+  // the other direction to look up by the robot module's ref_joint_order, which uses authored names).
+  std::unordered_map<std::string, std::string> orig_to_live_joint;
+  if(joints_it != art.original_names.end())
   {
-    return;
+    for(const auto & [live, orig] : joints_it->second)
+    {
+      orig_to_live_joint[orig] = live;
+    }
   }
-  if(state->type != mjEVENT_KEY && ImGui::GetIO().WantCaptureMouse)
+  std::unordered_map<std::string, std::string> orig_to_live_actuator;
+  if(actuators_it != art.original_names.end())
   {
-    return;
-  }
-  if(state->type == mjEVENT_KEY && state->key != 0)
-  {
-    // C: show contact points
-    if(state->key == GLFW_KEY_C)
+    for(const auto & [live, orig] : actuators_it->second)
     {
-      mj_sim->options.flags[mjVIS_CONTACTPOINT] = !mj_sim->options.flags[mjVIS_CONTACTPOINT];
+      orig_to_live_actuator[orig] = live;
     }
-    // F: show contact forces
-    if(state->key == GLFW_KEY_F)
-    {
-      if(!mj_sim->options.flags[mjVIS_CONTACTFORCE])
-      {
-        mj_sim->options.flags[mjVIS_CONTACTFORCE] = 1;
-        mj_sim->options.flags[mjVIS_CONTACTSPLIT] = 0;
-      }
-      else
-      {
-        if(!mj_sim->options.flags[mjVIS_CONTACTSPLIT])
-        {
-          mj_sim->options.flags[mjVIS_CONTACTSPLIT] = 1;
-        }
-        else
-        {
-          mj_sim->options.flags[mjVIS_CONTACTFORCE] = 0;
-          mj_sim->options.flags[mjVIS_CONTACTSPLIT] = 0;
-        }
-      }
-    }
-    // 0-mjNGROUP: Toggle visiblity of geom groups
-    if(state->key >= GLFW_KEY_0 && state->key < (GLFW_KEY_0 + mjNGROUP))
-    {
-      int group = state->key - GLFW_KEY_0;
-      mj_sim->options.geomgroup[group] = !mj_sim->options.geomgroup[group];
-    }
-    // Ctrl+S save the visualization state
-    if(state->key == GLFW_KEY_S && state->control)
-    {
-      mj_sim->saveGUISettings();
-    }
-    // SPACE: play/pause the simulation
-    if(state->key == GLFW_KEY_SPACE)
-    {
-      mj_sim->config.step_by_step = !mj_sim->config.step_by_step;
-    }
-    // RIGHT: advance simulation by one control step
-    if(state->key == GLFW_KEY_RIGHT)
-    {
-      if(mj_sim->config.step_by_step)
-      {
-        mj_sim->rem_steps = 1;
-      }
-    }
-    // E: visualize frames
-    if(state->key == GLFW_KEY_E)
-    {
-      mj_sim->options.frame += 1;
-      if(mj_sim->options.frame == mjNFRAME)
-      {
-        mj_sim->options.frame = 0;
-      }
-    }
-    // T: make transparent
-    if(state->key == GLFW_KEY_T)
-    {
-      mj_sim->options.flags[mjVIS_TRANSPARENT] = !mj_sim->options.flags[mjVIS_TRANSPARENT];
-    }
-    // V: render convex hull
-    if(state->key == GLFW_KEY_V)
-    {
-      mj_sim->options.flags[mjVIS_CONVEXHULL] = !mj_sim->options.flags[mjVIS_CONVEXHULL];
-    }
-    // TAB: switch cameras
-    if(state->key == GLFW_KEY_TAB)
-    {
-      mj_sim->camera.fixedcamid += 1;
-      mj_sim->camera.type = mjCAMERA_FIXED;
-      if(mj_sim->camera.fixedcamid == mj_sim->model->ncam)
-      {
-        mj_sim->camera.fixedcamid = -1;
-        mj_sim->camera.type = mjCAMERA_FREE;
-      }
-    }
-    return;
   }
 
-  // 3D scroll
-  if(state->type == mjEVENT_SCROLL && state->mouserect == 0 && mj_sim->model)
+  for(size_t i = 0; i < rjo.size(); ++i)
   {
-    // emulate vertical mouse motion = 5% of window height
-    mjv_moveCamera(mj_sim->model, mjMOUSE_ZOOM, 0, -0.05 * state->sy, &mj_sim->scene, &mj_sim->camera);
-    return;
-  }
+    const auto & jn = rjo[i];
 
-  // 3D press
-  if(state->type == mjEVENT_PRESS && state->mouserect == 0 && mj_sim->model)
-  {
-    // set perturbation
-    int newperturb = 0;
-    if(state->control && mj_sim->pert.select > 0)
+    std::string live_joint;
+    if(auto it = orig_to_live_joint.find(jn); it != orig_to_live_joint.end())
     {
-      // right: translate;  left: rotate
-      if(state->right)
-        newperturb = mjPERT_TRANSLATE;
-      else if(state->left)
-        newperturb = mjPERT_ROTATE;
-
-      // perturbation onset: reset reference
-      if(newperturb && !mj_sim->pert.active)
-        mjv_initPerturb(mj_sim->model, mj_sim->data, &mj_sim->scene, &mj_sim->pert);
+      live_joint = it->second;
     }
-    mj_sim->pert.active = newperturb;
-
-    // handle double-click
-    if(state->doubleclick)
-    {
-      // determine selection mode
-      int selmode;
-      if(state->button == mjBUTTON_LEFT)
-        selmode = 1;
-      else if(state->control)
-        selmode = 3;
-      else
-        selmode = 2;
-
-      // find geom and 3D click point, get corresponding body
-      mjrRect r = state->rect[0];
-      mjtNum selpnt[3];
-      int selgeom;
-      int selskin;
-#if mjVERSION_HEADER < 300
-      int selbody =
-          mjv_select(mj_sim->model, mj_sim->data, &mj_sim->options, (mjtNum)r.width / (mjtNum)r.height,
-                     (mjtNum)(state->x - r.left) / (mjtNum)r.width, (mjtNum)(state->y - r.bottom) / (mjtNum)r.height,
-                     &mj_sim->scene, selpnt, &selgeom, &selskin);
-#else
-      int selflex;
-      int selbody =
-          mjv_select(mj_sim->model, mj_sim->data, &mj_sim->options, (mjtNum)r.width / (mjtNum)r.height,
-                     (mjtNum)(state->x - r.left) / (mjtNum)r.width, (mjtNum)(state->y - r.bottom) / (mjtNum)r.height,
-                     &mj_sim->scene, selpnt, &selgeom, &selflex, &selskin);
-
-      selbody >= 0 ? mj_sim->pert.flexselect = selflex : mj_sim->pert.flexselect = -1;
-#endif
-
-      // set lookat point, start tracking is requested
-      if(selmode == 2 || selmode == 3)
-      {
-        // copy selpnt if anything clicked
-        if(selbody >= 0) mju_copy3(mj_sim->camera.lookat, selpnt);
-
-        // switch to tracking camera if dynamic body clicked
-        if(selmode == 3 && selbody > 0)
-        {
-          // mujoco camera
-          mj_sim->camera.type = mjCAMERA_TRACKING;
-          mj_sim->camera.trackbodyid = selbody;
-          mj_sim->camera.fixedcamid = -1;
-        }
-      }
-
-      // set body selection
-      else
-      {
-        if(selbody >= 0)
-        {
-
-          // record selection
-          mj_sim->pert.select = selbody;
-          mj_sim->pert.skinselect = selskin;
-
-          // compute localpos
-          mjtNum tmp[3];
-          mju_sub3(tmp, selpnt, mj_sim->data->xpos + 3 * mj_sim->pert.select);
-          mju_mulMatTVec(mj_sim->pert.localpos, mj_sim->data->xmat + 9 * mj_sim->pert.select, tmp, 3, 3);
-        }
-        else
-        {
-          mj_sim->pert.select = 0;
-          mj_sim->pert.skinselect = -1;
-        }
-      }
-
-      // stop perturbation on select
-      mj_sim->pert.active = 0;
-    }
-    return;
-  }
-
-  // 3D release
-  if(state->type == mjEVENT_RELEASE && state->dragrect == 0 && mj_sim->model)
-  {
-    // stop perturbation
-    mj_sim->pert.active = 0;
-    return;
-  }
-
-  // 3D move
-  if(state->type == mjEVENT_MOVE && state->dragrect == 0 && mj_sim->model)
-  {
-    // determine action based on mouse button
-    mjtMouse action;
-    if(state->right)
-      action = state->shift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
-    else if(state->left)
-      action = state->shift ? mjMOUSE_ROTATE_H : mjMOUSE_ROTATE_V;
     else
-      action = mjMOUSE_ZOOM;
+    {
+      // No rename reported (or original_names omitted entirely): fall back to the historical mc_mujoco
+      // convention of "<prefix>_<name>".
+      live_joint = art.prefix.empty() ? jn : fmt::format("{}_{}", art.prefix, jn);
+    }
+    if(mj_name2id(&model, mjOBJ_JOINT, live_joint.c_str()) != -1)
+    {
+      out.joint_names[i] = live_joint;
+    }
 
-    // move perturb or camera
-    mjrRect r = state->rect[0];
-    if(mj_sim->pert.active)
-      mjv_movePerturb(mj_sim->model, mj_sim->data, action, state->dx / r.height, -state->dy / r.height, &mj_sim->scene,
-                      &mj_sim->pert);
+    std::string live_act;
+    if(auto it = orig_to_live_actuator.find(jn); it != orig_to_live_actuator.end())
+    {
+      live_act = it->second;
+    }
     else
-      mjv_moveCamera(mj_sim->model, action, state->dx / r.height, -state->dy / r.height, &mj_sim->scene,
-                     &mj_sim->camera);
-    return;
+    {
+      live_act = art.prefix.empty() ? jn : fmt::format("{}_{}", art.prefix, jn);
+    }
+    if(mj_name2id(&model, mjOBJ_ACTUATOR, live_act.c_str()) != -1)
+    {
+      out.actuator_names[i] = live_act;
+    }
   }
+
+  return out;
 }
 
-void uiRender(mjuiState * state)
-{
-  auto mj_sim = static_cast<MjSimImpl *>(state->userdata);
-  mj_sim->render();
-}
+} // namespace
 
 /*******************************************************************************
- * Mujoco utility functions
+ * URLab handshake / model loading
  ******************************************************************************/
 
-bool mujoco_init(MjSimImpl * mj_sim,
-                 const std::map<std::string, std::string> & mujocoObjects,
-                 const std::map<std::string, std::string> & mcrtcObjects)
+bool mujoco_init(MjSimImpl * mj_sim)
 {
-#if mjVERSION_HEADER <= 200
-  // Initialize MuJoCo
-  if(!mujoco_initialized)
+  mc_rtc::log::info("[mc_mujoco] Connecting to URLab at {}", mj_sim->config.urlab_endpoint);
+  URLabHandshake hs;
+  try
   {
-    // Activate MuJoCo
-    const char * key_buf_ptr = getenv("MUJOCO_KEY_PATH");
-    std::string key_buf = [&]() -> std::string
+    hs = mj_sim->urlab->hello();
+    if(!hs.manager_present)
     {
-      if(key_buf_ptr)
-      {
-        return key_buf_ptr;
-      }
-      return mc_mujoco::MUJOCO_KEY_PATH;
-    }();
-    mj_activate(key_buf.c_str());
-    mujoco_initialized = true;
+      mc_rtc::log::info("[mc_mujoco] URLab editor has no active PIE session, requesting begin_pie...");
+      hs = mj_sim->urlab->beginPIE(mj_sim->config.urlab_pie_timeout_s);
+    }
   }
-#endif
-
-  // Load the model;
-  std::string model = merge_mujoco_models(mujocoObjects, mcrtcObjects, mj_sim->objects, mj_sim->robots);
-  char error[1000] = "Could not load XML model";
-  mj_sim->model = mj_loadXML(model.c_str(), 0, error, 1000);
-  if(!mj_sim->model)
+  catch(const URLabError & e)
   {
-    std::cerr << error << std::endl;
+    mc_rtc::log::error("[mc_mujoco] URLab handshake failed: {}", e.what());
     return false;
   }
 
-  // make data
+  if(hs.mjb.empty())
+  {
+    mc_rtc::log::error("[mc_mujoco] URLab handshake did not provide a compiled model (mjb)");
+    return false;
+  }
+
+  mc_rtc::log::info("[mc_mujoco] Connected to URLab {} (MuJoCo {}), session {}", hs.urlab_version, hs.mujoco_version,
+                    hs.session_id);
+
+  // mj_loadModel only reads from disk; round-trip the compiled binary through a temp file.
+  auto tmp_path = write_temp_mjb(hs.mjb);
+  char error[1000] = "Could not load model from URLab";
+  mj_sim->model = mj_loadModel(tmp_path.c_str(), nullptr, error, 1000);
+  std::remove(tmp_path.c_str());
+  if(!mj_sim->model)
+  {
+    mc_rtc::log::error("[mc_mujoco] Failed to load URLab-provided model: {}", error);
+    return false;
+  }
   mj_sim->data = mj_makeData(mj_sim->model);
+
+  // Match every mc_rtc robot to a URLab articulation by prefix == robot module name. This mirrors the
+  // historical mc_mujoco convention where the MJCF model name equals the mc_rtc robot module name.
+  for(const auto & r : mj_sim->get_controller()->robots())
+  {
+    auto art_it = std::find_if(hs.articulations.begin(), hs.articulations.end(),
+                               [&](const auto & a) { return a.prefix == r.module().name; });
+    if(art_it == hs.articulations.end())
+    {
+      // Not every mc_rtc robot needs a URLab articulation (e.g. a purely kinematic "robot" used for
+      // planning only); skip silently, as the original local-mujoco code allowed this too (objects vs.
+      // robots note in the README).
+      continue;
+    }
+
+    MjRobot robot;
+    robot.name = r.name();
+    robot.prefix = art_it->prefix;
+
+    const auto & rjo = r.module().ref_joint_order();
+    auto resolved = resolve_names(*mj_sim->model, *art_it, rjo);
+    robot.mj_jnt_names = resolved.joint_names;
+    robot.mj_act_names = resolved.actuator_names;
+
+    // Root body / joint: derive from the robot's mb() root link, prefixed the same way joints are.
+    if(r.mb().nrJoints() > 0 && r.mb().joint(0).type() == rbd::Joint::Type::Free)
+    {
+      robot.root_joint_type = mjJNT_FREE;
+      robot.root_body =
+          art_it->prefix.empty() ? r.mb().body(0).name() : fmt::format("{}_{}", art_it->prefix, r.mb().body(0).name());
+      // The free joint itself does not have a stable authored name we can resolve through
+      // original_names (it is typically anonymous in the MJCF); fall back to the body name suffixed
+      // with "_freejoint", matching mc_mujoco's historical robot-module convention. If this does not
+      // resolve, root_joint_type detection below (via the body's first joint) is used instead.
+      auto candidate = fmt::format("{}_freejoint", robot.root_body);
+      if(mj_name2id(mj_sim->model, mjOBJ_JOINT, candidate.c_str()) != -1)
+      {
+        robot.root_joint = candidate;
+      }
+    }
+
+    mj_sim->robots.push_back(std::move(robot));
+  }
+
+  if(mj_sim->robots.empty())
+  {
+    mc_rtc::log::warning("[mc_mujoco] No mc_rtc robot matched a URLab articulation by prefix. Check that each robot "
+                         "module's name matches the MJCF model name URLab reports.");
+  }
 
   return true;
 }
 
+/*******************************************************************************
+ * GUI window (mc_rtc 2D panel only)
+ ******************************************************************************/
+
 void mujoco_create_window(MjSimImpl * mj_sim)
 {
-#ifdef USE_UI_ADAPTER
-  mj_sim->platform_ui_adapter.reset(new mujoco::GlfwAdapter());
-  mj_sim->platform_ui_adapter->SetWindowTitle("mc_mujoco");
-#else
-  // Initialize GLFW
   if(!glfw_initialized)
   {
     if(!glfwInit())
@@ -355,8 +267,28 @@ void mujoco_create_window(MjSimImpl * mj_sim)
     glfw_initialized = true;
   }
 
-  // create window, make OpenGL context current, request v-sync
-  mj_sim->window = glfwCreateWindow(1600, 900, "mc_mujoco", NULL, NULL);
+  // Decide GL+GLSL versions
+#if defined(IMGUI_IMPL_OPENGL_ES2)
+  const char * glsl_version = "#version 100";
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+  glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+#elif defined(__APPLE__)
+  const char * glsl_version = "#version 150";
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+  glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#else
+  const char * glsl_version = "#version 130";
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#endif
+
+  // Small, fixed-size window: this is a GUI panel (mc_rtc forms/plots/tree), not a 3D viewport, so it
+  // does not need to be large. Resizable in case panels grow.
+  mj_sim->window =
+      glfwCreateWindow(900, 700, "mc_mujoco (mc_rtc GUI -- robot rendered in Unreal Engine)", nullptr, nullptr);
   if(!mj_sim->window)
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] GLFW window creation failed");
@@ -364,103 +296,8 @@ void mujoco_create_window(MjSimImpl * mj_sim)
   glfwMakeContextCurrent(mj_sim->window);
   glfwSwapInterval(1);
   glfwSetWindowUserPointer(mj_sim->window, static_cast<void *>(mj_sim));
-#endif
+  glfwSetKeyCallback(mj_sim->window, glfwKeyCallback);
 
-  // initialize visualization data structures
-  auto config = [&]() -> mc_rtc::Configuration
-  {
-    auto path = fmt::format("{}/mc_mujoco.yaml", USER_FOLDER);
-    if(fs::exists(path))
-    {
-      return {path};
-    }
-    return {};
-  }();
-  auto camera = config("camera", mc_rtc::Configuration{});
-  mjv_defaultCamera(&mj_sim->camera);
-  int ctype = static_cast<int>(camera("type", 0));
-  int cid = static_cast<int>(camera("fixedcamid", -1));
-  int bid = static_cast<int>(camera("trackbodyid", -1));
-  if(ctype == mjCAMERA_FIXED && cid < mj_sim->model->ncam)
-  {
-    mj_sim->camera.type = ctype;
-    mj_sim->camera.fixedcamid = cid;
-  }
-  if(ctype == mjCAMERA_TRACKING && bid < mj_sim->model->nbody)
-  {
-    mj_sim->camera.type = ctype;
-    mj_sim->camera.trackbodyid = bid;
-  }
-  auto lookat = camera("lookat", std::array<double, 3>{0.0, 0.0, 0.75});
-  mj_sim->camera.lookat[0] = static_cast<float>(lookat[0]);
-  mj_sim->camera.lookat[1] = static_cast<float>(lookat[1]);
-  mj_sim->camera.lookat[2] = static_cast<float>(lookat[2]);
-  mj_sim->camera.distance = static_cast<float>(camera("distance", 6.0));
-  mj_sim->camera.azimuth = static_cast<float>(camera("azimuth", -150.0));
-  mj_sim->camera.elevation = static_cast<float>(camera("elevation", -20.0));
-  mjv_defaultOption(&mj_sim->options);
-  auto visualize = config("visualize", mc_rtc::Configuration{});
-  mj_sim->options.geomgroup[0] = mj_sim->config.visualize_collisions.value_or(visualize("collisions", false));
-  mj_sim->options.geomgroup[1] = mj_sim->config.visualize_visual.value_or(visualize("visuals", true));
-  mj_sim->options.flags[mjVIS_CONTACTPOINT] = visualize("contact-points", false);
-  mj_sim->options.flags[mjVIS_CONTACTFORCE] = visualize("contact-forces", false);
-  mj_sim->options.flags[mjVIS_CONTACTSPLIT] = visualize("contact-split", false);
-  mjv_defaultScene(&mj_sim->scene);
-#ifndef USE_UI_ADAPTER
-  mjr_defaultContext(&mj_sim->context);
-#endif
-
-  // create scene and context
-  mjv_makeScene(mj_sim->model, &mj_sim->scene, 2000);
-#ifdef USE_UI_ADAPTER
-  mjr_makeContext(mj_sim->model, &mj_sim->platform_ui_adapter->mjr_context(), mjFONTSCALE_150);
-#else
-  mjr_makeContext(mj_sim->model, &mj_sim->context, mjFONTSCALE_150);
-#endif
-
-  // install GLFW event callback
-#ifdef USE_UI_ADAPTER
-  auto & uistate = mj_sim->platform_ui_adapter->state();
-#else
-  auto & uistate = mj_sim->uistate;
-#endif
-  uistate.userdata = static_cast<void *>(mj_sim);
-#ifndef USE_UI_ADAPTER
-#  if mjVERSION_HEADER >= 230
-  uiSetCallback(mj_sim->window, &mj_sim->uistate, uiEvent, uiLayout, uiRender, nullptr);
-#  else
-  uiSetCallback(mj_sim->window, &mj_sim->uistate, uiEvent, uiLayout);
-#  endif
-#else
-  mj_sim->platform_ui_adapter->SetEventCallback(uiEvent);
-  mj_sim->platform_ui_adapter->SetLayoutCallback(uiLayout);
-#endif
-  uiLayout(&uistate);
-
-  /** Initialize Dear Imgui */
-
-  // Decide GL+GLSL versions
-#if defined(IMGUI_IMPL_OPENGL_ES2)
-  // GL ES 2.0 + GLSL 100
-  const char * glsl_version = "#version 100";
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-  glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
-#elif defined(__APPLE__)
-  // GL 3.2 + GLSL 150
-  const char * glsl_version = "#version 150";
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE); // 3.2+ only
-  glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE); // Required on Mac
-#else
-  // GL 3.0 + GLSL 130
-  const char * glsl_version = "#version 130";
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-  // glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
-  // glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);            // 3.0+ only
-#endif
   ImGui::CreateContext();
   ImPlot::CreateContext();
   ImGuiIO & io = ImGui::GetIO();
@@ -468,7 +305,7 @@ void mujoco_create_window(MjSimImpl * mj_sim)
   fontConfig.FontDataOwnedByAtlas = false;
   ImVector<ImWchar> ranges;
   ImFontGlyphRangesBuilder builder;
-  builder.AddText(u8"μ");
+  builder.AddText(u8"\u03bc");
   builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
   builder.BuildRanges(&ranges);
   io.FontDefault =
@@ -480,37 +317,22 @@ void mujoco_create_window(MjSimImpl * mj_sim)
   auto & style = ImGui::GetStyle();
   style.FrameRounding = 6.0f;
   auto & bgColor = style.Colors[ImGuiCol_WindowBg];
-  bgColor.w = 0.5f;
-#ifdef USE_UI_ADAPTER
-  auto & glfw_adapter = *dynamic_cast<mujoco::GlfwAdapter *>(mj_sim->platform_ui_adapter.get());
-  ImGui_ImplGlfw_InitForOpenGL(glfw_adapter.window_, true);
-#else
+  bgColor.w = 0.95f;
+
   ImGui_ImplGlfw_InitForOpenGL(mj_sim->window, true);
-#endif
   ImGui_ImplOpenGL3_Init(glsl_version);
 }
 
 void mujoco_cleanup(MjSimImpl * mj_sim)
 {
-  if(mj_sim->config.with_visualization)
+  if(mj_sim->window)
   {
-    // Close the window
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
-
-#ifndef USE_UI_ADAPTER
     glfwDestroyWindow(mj_sim->window);
-#endif
-
-    // free visualization storage
-    mjv_freeScene(&mj_sim->scene);
-#ifndef USE_UI_ADAPTER
-    mjr_freeContext(&mj_sim->context);
-#endif
   }
 
-  // free MuJoCo model and data, deactivate
   mj_deleteData(mj_sim->data);
   mj_deleteModel(mj_sim->model);
 

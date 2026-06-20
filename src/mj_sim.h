@@ -18,11 +18,10 @@ struct MjSim
 public:
   /*! \brief Constructor
    *
-   * Prepare to start a simulation.
+   * Connects to the URLab bridge server, performs the handshake, loads the resulting model locally, and
+   * prepares to start a simulation.
    *
    * \param config Configuration for mc_mujoco
-   *
-   * \param mc_config Configuration file used by mc_rtc
    *
    */
   MjSim(const MjConfiguration & config);
@@ -34,7 +33,9 @@ public:
   void resetSimulation(const std::map<std::string, std::vector<double>> & reset_qs = {},
                        const std::map<std::string, sva::PTransformd> & reset_pos = {});
 
-  /** Plays one step of physics simulation, should be called as often as possible
+  /** Sends one URLab step() RPC (advancing frameskip_ physics steps) and runs one mc_rtc control tick.
+   * Should be called as often as possible; pacing against URLab's own physics rate is not necessary
+   * since "direct" step mode blocks until the requested steps have completed server-side.
    *
    * \returns True if the controller fails and the simulation should stop
    */
@@ -43,10 +44,8 @@ public:
   /*! Stop the simulation */
   void stopSimulation();
 
-  /*! Prepare to render */
-  void updateScene();
-
-  /*! Update the GUI, no-op if visualization is disabled
+  /*! Update and draw the mc_rtc GUI window (2D ImGui panel only -- no 3D scene, URLab renders the robot
+   * and environment in Unreal Engine). No-op if the GUI is disabled.
    *
    * \returns False if the application should quit
    */
@@ -58,10 +57,11 @@ public:
    */
   mc_control::MCGlobalController * controller() noexcept;
 
-  /** Return the MuJoCo model */
+  /** Return the local MuJoCo model mirror (loaded from URLab's handshake mjb) */
   mjModel & model() noexcept;
 
-  /** Return the MuJoCo data */
+  /** Return the local MuJoCo data mirror (kinematics only, written from URLab's step replies; never
+   * locally integrated) */
   mjData & data() noexcept;
 
 private:

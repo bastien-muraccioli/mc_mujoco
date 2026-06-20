@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <type_traits>
-#include <unordered_set>
 
 #include "MujocoClient.h"
 #include "config.h"
@@ -15,16 +17,10 @@
 
 #include "implot.h"
 
-#include "ImGuizmo.h"
-
 #include <filesystem>
 namespace fs = std::filesystem;
 
 #include <mc_rtc/version.h>
-
-#ifdef USE_UI_ADAPTER
-#  include "our_glfw_adapter.h"
-#endif
 
 namespace mc_mujoco
 {
@@ -96,7 +92,6 @@ bool MjRobot::loadGain(const std::string & path_to_pd, const std::vector<std::st
   for(unsigned int i = 0; i < num_joints; i++)
   {
     mc_rtc::log::info("[mc_mujoco] {}, pgain = {}, dgain = {}", joints[i], default_pgain[i], default_dgain[i]);
-    // push to kp and kd
     default_kp.push_back(default_pgain[i]);
     default_kd.push_back(default_dgain[i]);
     kp.push_back(default_pgain[i]);
@@ -125,137 +120,63 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
     return "";
   };
 
-  /** Map between name and xml file path of objects specified in mujoco config **/
-  std::map<std::string, std::string> mjObjects;
-  /** Map between name and xml file path of objects specified in mc-rtc config **/
-  std::map<std::string, std::string> mcObjects;
-  /** Map between name and pdgains file path of objects specified in mc-rtc config **/
+  // We still read each mc_rtc robot's <robot>.yaml for pdGainsPath: PD gains remain mc_mujoco/mc_rtc's
+  // responsibility even though the model geometry itself now comes from URLab. xmlModelPath (if present)
+  // is ignored: URLab is the sole source of the compiled model.
   std::map<std::string, std::string> pdGainsFiles;
-
-  // load all robots named in mujoco config
-  auto mc_mujoco_cfg_path = fmt::format("{}/mc_mujoco.yaml", USER_FOLDER);
-  auto mc_mujoco_cfg = [&mc_mujoco_cfg_path]() -> mc_rtc::Configuration
-  {
-    if(fs::exists(mc_mujoco_cfg_path))
-    {
-      return {mc_mujoco_cfg_path};
-    }
-    return {};
-  }();
-  auto config_objects = mc_mujoco_cfg("objects", std::map<std::string, mc_rtc::Configuration>{});
-  for(const auto & co : config_objects)
-  {
-    MjObject object;
-    object.name = static_cast<std::string>(co.first);
-    object.init_pose = static_cast<sva::PTransformd>(co.second("init_pos", sva::PTransformd::Identity()));
-    objects.push_back(object);
-
-    std::string module = co.second("module");
-    auto object_cfg_path = get_robot_cfg_path(module);
-    if(object_cfg_path.empty())
-    {
-      mc_rtc::log::error_and_throw<std::runtime_error>(
-          "[mc_mujoco] Module ({}) cannot be found at for object {}.\nTried:\n- {}\n- {}", module, co.first,
-          get_robot_cfg_path_local(module).string(), get_robot_cfg_path_global(module).string());
-    }
-    auto object_cfg = mc_rtc::Configuration(object_cfg_path);
-    if(!object_cfg.has("xmlModelPath"))
-    {
-      mc_rtc::log::error_and_throw<std::runtime_error>("Missing xmlModelPath in {}", object_cfg_path);
-    }
-    std::string xmlFile = static_cast<std::string>(object_cfg("xmlModelPath"));
-    mjObjects[object.name] = xmlFile;
-    if(!fs::exists(xmlFile))
-    {
-      mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] XML model cannot be found at {} for {}", xmlFile,
-                                                       co.first);
-    }
-  }
-
-  // load all robots named in mc-rtc config
   for(const auto & r : controller->robots())
   {
     const auto & robot_cfg_path = get_robot_cfg_path(r.module().name);
-    if(!robot_cfg_path.empty())
+    if(robot_cfg_path.empty())
     {
-      auto robot_cfg = mc_rtc::Configuration(robot_cfg_path);
-
-      auto main_robot_params = [&]() -> std::vector<std::string>
-      {
-        auto main_robot_cfg = controller->configuration().config.find("MainRobot");
-        if(!main_robot_cfg)
-        {
-          return {"JVRC1"};
-        }
-        if(main_robot_cfg->isArray())
-        {
-          return main_robot_cfg->operator std::vector<std::string>();
-        }
-        if(main_robot_cfg->isObject())
-        {
-          auto module_cfg = (*main_robot_cfg)("module");
-          if(module_cfg.isArray())
-          {
-            return module_cfg.operator std::vector<std::string>();
-          }
-          return {module_cfg.operator std::string()};
-        }
-        return {main_robot_cfg->operator std::string()};
-      }();
-
-      const auto & main_robot_name = main_robot_params[0];
-      auto setObjectXML = [&](const std::string & xmlFile)
-      {
-        std::string pdGainsPath = "";
-        mcObjects[r.name()] = xmlFile;
-        if(!main_robot_name.empty() && robot_cfg.find(main_robot_name)
-           && robot_cfg(main_robot_name).find("pdGainsPath"))
-        {
-          pdGainsPath = robot_cfg(main_robot_name)("pdGainsPath", std::string(""));
-        }
-        else if(robot_cfg.find(r.name().c_str()) && robot_cfg(r.name().c_str()).find("pdGainsPath")
-                && !robot_cfg(r.name().c_str())("pdGainsPath", std::string("")).empty())
-        {
-          pdGainsPath = robot_cfg(r.name().c_str())("pdGainsPath", std::string(""));
-        }
-        else if(robot_cfg.find("pdGainsPath"))
-        {
-          pdGainsPath = robot_cfg("pdGainsPath", std::string(""));
-        }
-
-        if(!fs::exists(xmlFile))
-        {
-          mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] XML model cannot be found at {} for {}",
-                                                           xmlFile, r.name());
-        }
-
-        pdGainsFiles[r.name()] = pdGainsPath;
-      };
-
-      if(!robot_cfg.has("xmlModelPath") && (!robot_cfg.has(r.name()) || robot_cfg.has(main_robot_name)))
-      {
-        mc_rtc::log::error_and_throw<std::runtime_error>("Missing xmlModelPath in {}", robot_cfg_path);
-      }
-      else if(robot_cfg.has(main_robot_name))
-      {
-        setObjectXML(static_cast<std::string>(robot_cfg(main_robot_name)("xmlModelPath")));
-      }
-      else if(robot_cfg.has(r.name()))
-      {
-        setObjectXML(static_cast<std::string>(robot_cfg(r.name())("xmlModelPath")));
-      }
-      else
-      {
-        setObjectXML(static_cast<std::string>(robot_cfg("xmlModelPath")));
-      }
+      continue;
     }
+    auto robot_cfg = mc_rtc::Configuration(robot_cfg_path);
+
+    auto main_robot_params = [&]() -> std::vector<std::string>
+    {
+      auto main_robot_cfg = controller->configuration().config.find("MainRobot");
+      if(!main_robot_cfg)
+      {
+        return {"JVRC1"};
+      }
+      if(main_robot_cfg->isArray())
+      {
+        return main_robot_cfg->operator std::vector<std::string>();
+      }
+      if(main_robot_cfg->isObject())
+      {
+        auto module_cfg = (*main_robot_cfg)("module");
+        if(module_cfg.isArray())
+        {
+          return module_cfg.operator std::vector<std::string>();
+        }
+        return {module_cfg.operator std::string()};
+      }
+      return {main_robot_cfg->operator std::string()};
+    }();
+    const auto & main_robot_name = main_robot_params[0];
+
+    std::string pdGainsPath = "";
+    if(!main_robot_name.empty() && robot_cfg.find(main_robot_name) && robot_cfg(main_robot_name).find("pdGainsPath"))
+    {
+      pdGainsPath = robot_cfg(main_robot_name)("pdGainsPath", std::string(""));
+    }
+    else if(robot_cfg.find(r.name().c_str()) && robot_cfg(r.name().c_str()).find("pdGainsPath")
+            && !robot_cfg(r.name().c_str())("pdGainsPath", std::string("")).empty())
+    {
+      pdGainsPath = robot_cfg(r.name().c_str())("pdGainsPath", std::string(""));
+    }
+    else if(robot_cfg.find("pdGainsPath"))
+    {
+      pdGainsPath = robot_cfg("pdGainsPath", std::string(""));
+    }
+    pdGainsFiles[r.name()] = pdGainsPath;
   }
 
-  // load MuJoCo plugins
-  loadPlugins(mc_mujoco_cfg);
-
-  // initial mujoco here and load XML model
-  bool initialized = mujoco_init(this, mjObjects, mcObjects);
+  // Connect to URLab and load the model it reports.
+  urlab = std::make_unique<URLabClient>(config.urlab_endpoint, config.urlab_timeout_ms);
+  bool initialized = mujoco_init(this);
   if(!initialized)
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] Initialized failed.");
@@ -266,13 +187,13 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
   {
     auto & r = robots[i];
     bool has_motor =
-        std::any_of(r.mj_mot_names.begin(), r.mj_mot_names.end(), [](const std::string & m) { return !m.empty(); });
+        std::any_of(r.mj_act_names.begin(), r.mj_act_names.end(), [](const std::string & m) { return !m.empty(); });
     const auto & robot = controller->robot(r.name);
     if(robot.mb().nrDof() == 0 || (robot.mb().nrDof() == 6 && robot.mb().joint(0).dof() == 6) || !has_motor)
     {
       continue;
     }
-    if(!fs::exists(pdGainsFiles[r.name]))
+    if(pdGainsFiles.count(r.name) == 0 || !fs::exists(pdGainsFiles[r.name]))
     {
       mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] PD gains file for {} cannot be found at {}", r.name,
                                                        pdGainsFiles[r.name]);
@@ -280,13 +201,10 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
     r.loadGain(pdGainsFiles[r.name], controller->robots().robot(r.name).module().ref_joint_order());
   }
 
-  if(config.with_visualization)
+  if(config.with_mc_rtc_gui)
   {
     mujoco_create_window(this);
-    if(config.with_mc_rtc_gui)
-    {
-      client = std::make_unique<MujocoClient>();
-    }
+    client = std::make_unique<MujocoClient>();
   }
   mc_rtc::log::info("[mc_mujoco] Initialized successful.");
 }
@@ -296,48 +214,12 @@ void MjSimImpl::cleanup()
   mujoco_cleanup(this);
 }
 
-void MjObject::initialize(mjModel * model)
-{
-  if(!root_body.empty())
-  {
-    root_body_id = mj_name2id(model, mjOBJ_BODY, root_body.c_str());
-  }
-  if(!root_joint.empty())
-  {
-    auto root_joint_id = mj_name2id(model, mjOBJ_JOINT, root_joint.c_str());
-    root_qpos_idx = model->jnt_qposadr[root_joint_id];
-    root_qvel_idx = model->jnt_dofadr[root_joint_id];
-  }
-}
-
 void MjRobot::initialize(mjModel * model, const mc_rbdyn::Robot & robot)
 {
   mj_jnt_ids.resize(0);
   for(const auto & j : mj_jnt_names)
   {
-    mj_jnt_ids.push_back(mj_name2id(model, mjOBJ_JOINT, j.c_str()));
-  }
-  auto fill_actuator_ids = [&](const std::vector<std::string> & names, std::vector<int> & ids)
-  {
-    ids.resize(0);
-    for(const auto & n : names)
-    {
-      if(!n.empty())
-      {
-        ids.push_back(mj_name2id(model, mjOBJ_ACTUATOR, n.c_str()));
-      }
-      else
-      {
-        ids.push_back(-1);
-      }
-    }
-  };
-  fill_actuator_ids(mj_mot_names, mj_mot_ids);
-  fill_actuator_ids(mj_pos_act_names, mj_pos_act_ids);
-  fill_actuator_ids(mj_vel_act_names, mj_vel_act_ids);
-  if(!mj_general_act_name.empty())
-  {
-    mj_general_act_id = mj_name2id(model, mjOBJ_ACTUATOR, mj_general_act_name.c_str());
+    mj_jnt_ids.push_back(j.empty() ? -1 : mj_name2id(model, mjOBJ_JOINT, j.c_str()));
   }
   if(!root_body.empty())
   {
@@ -384,36 +266,18 @@ void MjRobot::initialize(mjModel * model, const mc_rbdyn::Robot & robot)
 
 void MjRobot::reset(const mc_rbdyn::Robot & robot)
 {
-  const auto & mbc = robot.mbc();
   const auto & rjo = robot.module().ref_joint_order();
-  std::unordered_set<std::string> gripper_active_joints;
-  for(const auto & g : robot.grippers())
-  {
-    for(const auto & joint : g.get().activeJoints())
-    {
-      gripper_active_joints.insert(joint);
-    }
-  }
-  if(mj_jnt_names.size() > rjo.size())
-  {
-    mc_rtc::log::error_and_throw<std::runtime_error>(
-        "[mc_mujoco] Missmatch in model for {}, reference joint order has {} joints but MuJoCo models has {} joints",
-        name, rjo.size(), mj_jnt_names.size());
-  }
   if(rjo.size() != mj_jnt_names.size())
   {
-    mc_rtc::log::info("[mc_mujoco] {} uses {} controller joints for {} MuJoCo joints; unmatched MuJoCo joints will "
-                      "be treated as internal/passive joints",
-                      name, rjo.size(), mj_jnt_names.size());
+    mc_rtc::log::error_and_throw<std::runtime_error>(
+        "[mc_mujoco] Missmatch in model for {}, reference joint order has {} joints but MuJoCo model has {} joints",
+        name, rjo.size(), mj_jnt_names.size());
   }
   mj_to_mbc.resize(0);
   mj_prev_ctrl_q.resize(0);
   mj_prev_ctrl_alpha.resize(0);
   mj_prev_ctrl_jointTorque.resize(0);
   mj_jnt_to_rjo.resize(0);
-  mj_to_mbc.resize(0);
-  mj_is_gripper_joint.resize(0);
-  mj_general_act_ctrl_idx = -1;
   encoders = std::vector<double>(rjo.size(), 0.0);
   alphas = std::vector<double>(rjo.size(), 0.0);
   torques = std::vector<double>(rjo.size(), 0.0);
@@ -421,7 +285,7 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
   {
     const auto & jn = [&]()
     {
-      if(!prefix.empty())
+      if(!prefix.empty() && mj_jn.size() > prefix.size() + 1)
       {
         return mj_jn.substr(prefix.size() + 1);
       }
@@ -438,7 +302,6 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
     {
       auto jIndex = robot.jointIndexByName(jn);
       mj_to_mbc.push_back(jIndex);
-      mj_is_gripper_joint.push_back(gripper_active_joints.count(jn) != 0);
       if(robot.mb().joint(jIndex).dof() != 1)
       {
         mc_rtc::log::error_and_throw<std::runtime_error>(
@@ -457,25 +320,8 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
     else
     {
       mj_to_mbc.push_back(-1);
-      mj_is_gripper_joint.push_back(false);
-      mc_rtc::log::warning("[mc_mujoco] No matching joint in controller for MuJoCo joint {} in {}", mj_jn, name);
     }
   }
-  if(mj_general_act_id != -1 && gripper_active_joints.size() == 1)
-  {
-    const auto prefixed_joint = prefixed(*gripper_active_joints.begin());
-    auto it = std::find(mj_jnt_names.begin(), mj_jnt_names.end(), prefixed_joint);
-    if(it != mj_jnt_names.end())
-    {
-      mj_general_act_ctrl_idx = static_cast<int>(std::distance(mj_jnt_names.begin(), it));
-    }
-    else
-    {
-      mc_rtc::log::warning("[mc_mujoco] Could not map gripper joint {} to a MuJoCo command source in {}",
-                           *gripper_active_joints.begin(), name);
-    }
-  }
-  mj_ctrl = std::vector<double>(mj_prev_ctrl_q.size(), 0.0);
   mj_next_ctrl_q = mj_prev_ctrl_q;
   mj_next_ctrl_alpha = mj_prev_ctrl_alpha;
   mj_next_ctrl_jointTorque = mj_prev_ctrl_jointTorque;
@@ -485,36 +331,6 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
   kd = default_kd;
 }
 
-template<typename T>
-void MjSimImpl::setPosW(const T & robot, const sva::PTransformd & pos)
-{
-  const auto & t = pos.translation();
-  Eigen::Quaterniond q = Eigen::Quaterniond(pos.rotation()).inverse();
-  if(robot.root_qpos_idx != -1 && robot.root_joint_type == mjJNT_FREE)
-  {
-    data->qpos[robot.root_qpos_idx + 0] = t.x();
-    data->qpos[robot.root_qpos_idx + 1] = t.y();
-    data->qpos[robot.root_qpos_idx + 2] = t.z();
-    data->qpos[robot.root_qpos_idx + 3] = q.w();
-    data->qpos[robot.root_qpos_idx + 4] = q.x();
-    data->qpos[robot.root_qpos_idx + 5] = q.y();
-    data->qpos[robot.root_qpos_idx + 6] = q.z();
-    // push linear/angular velocities
-    mju_zero3(&data->qvel[robot.root_qvel_idx]);
-    mju_zero3(&data->qvel[robot.root_qvel_idx + 3]);
-  }
-  else if(robot.root_body_id != -1)
-  {
-    model->body_pos[3 * robot.root_body_id + 0] = t.x();
-    model->body_pos[3 * robot.root_body_id + 1] = t.y();
-    model->body_pos[3 * robot.root_body_id + 2] = t.z();
-    model->body_quat[4 * robot.root_body_id + 0] = q.w();
-    model->body_quat[4 * robot.root_body_id + 1] = q.x();
-    model->body_quat[4 * robot.root_body_id + 2] = q.y();
-    model->body_quat[4 * robot.root_body_id + 3] = q.z();
-  }
-}
-
 sva::PTransformd MjSimImpl::getObjectPosW(const std::string & object) const
 {
   auto it = std::find_if(objects.begin(), objects.end(), [&](const auto & o) { return o.name == object; });
@@ -522,81 +338,32 @@ sva::PTransformd MjSimImpl::getObjectPosW(const std::string & object) const
   {
     mc_rtc::log::error_and_throw("Requested position of object {} which is not in this simulation", object);
   }
-  const auto & o = *it;
-  if(o.root_qpos_idx != -1 && o.root_joint_type == mjJNT_FREE)
-  {
-    Eigen::Vector3d t = Eigen::Map<Eigen::Vector3d>(&data->qpos[o.root_qpos_idx]);
-    // Note: no map here because Eigen::Map wants x, y, z, w
-    Eigen::Quaterniond q;
-    q.w() = data->qpos[o.root_qpos_idx + 3];
-    q.x() = data->qpos[o.root_qpos_idx + 4];
-    q.y() = data->qpos[o.root_qpos_idx + 5];
-    q.z() = data->qpos[o.root_qpos_idx + 6];
-    return {q.inverse(), t};
-  }
-  if(o.root_body_id != -1)
-  {
-    Eigen::Vector3d t = Eigen::Map<Eigen::Vector3d>(&model->body_pos[3 * o.root_body_id]);
-    Eigen::Quaterniond q;
-    q.w() = model->body_quat[4 * o.root_body_id + 0];
-    q.x() = model->body_quat[4 * o.root_body_id + 1];
-    q.y() = model->body_quat[4 * o.root_body_id + 2];
-    q.z() = model->body_quat[4 * o.root_body_id + 3];
-    return {q.inverse(), t};
-  }
-  mc_rtc::log::error_and_throw("Cannot retrieve the position of object {} in simulation", object);
+  return it->posW;
 }
 
-void MjSimImpl::setSimulationInitialState()
+void MjSimImpl::setObjectPosW(const std::string & object, const sva::PTransformd &)
 {
-  if(controller)
+  // URLab owns physics state; mc_mujoco cannot push an authoritative pose into it (no equivalent
+  // "teleport entity" RPC is used by this bridge). Kept as a no-op (rather than removing the datastore
+  // call) so existing controllers that call {object}::SetPosW do not crash, with a one-time warning.
+  static std::set<std::string> warned;
+  if(warned.insert(object).second)
   {
-    for(auto & o : objects)
-    {
-      o.initialize(model);
-      setPosW(o, o.init_pose);
-    }
-
-    for(auto & r : robots)
-    {
-      const auto & robot = controller->robots().robot(r.name);
-      r.initialize(model, robot);
-      setPosW(r, robot.posW());
-      for(size_t i = 0; i < r.mj_jnt_ids.size(); ++i)
-      {
-        if(r.mj_jnt_to_rjo[i] == -1)
-        {
-          continue;
-        }
-        data->qpos[model->jnt_qposadr[r.mj_jnt_ids[i]]] = r.encoders[r.mj_jnt_to_rjo[i]];
-        data->qvel[model->jnt_dofadr[r.mj_jnt_ids[i]]] = r.alphas[r.mj_jnt_to_rjo[i]];
-      }
-    }
-  }
-  mj_forward(model, data);
-}
-
-void MjSimImpl::setObjectPosW(const std::string & object, const sva::PTransformd & pt)
-{
-  for(const auto & o : objects)
-  {
-    if(o.name == object)
-    {
-      setPosW(o, pt);
-      return;
-    }
+    mc_rtc::log::warning(
+        "[mc_mujoco] {}::SetPosW was called, but object poses are authoritative in URLab and cannot be "
+        "overridden from mc_mujoco in this bridge configuration. Ignoring.",
+        object);
   }
 }
 
-void MjSimImpl::setRobotPosW(const std::string & robot, const sva::PTransformd & pt)
+void MjSimImpl::setRobotPosW(const std::string & robot, const sva::PTransformd &)
 {
-  for(const auto & r : robots)
+  static std::set<std::string> warned;
+  if(warned.insert(robot).second)
   {
-    if(r.name == robot)
-    {
-      setPosW(r, pt);
-      return;
-    }
+    mc_rtc::log::warning("[mc_mujoco] {}::SetPosW was called, but robot poses are authoritative in URLab and cannot be "
+                         "overridden from mc_mujoco in this bridge configuration. Ignoring.",
+                         robot);
   }
 }
 
@@ -610,7 +377,6 @@ void MjSimImpl::makeDatastoreCalls()
   for(auto & r : robots)
   {
     ds.make_call(r.name + "::SetPosW", [this, name = r.name](const sva::PTransformd & pt) { setRobotPosW(name, pt); });
-    // make_call for setting pd gains (for all joints)
     ds.make_call(r.name + "::SetPDGains",
                  [this, &r](const std::vector<double> & p_vec, const std::vector<double> & d_vec)
                  {
@@ -632,7 +398,6 @@ void MjSimImpl::makeDatastoreCalls()
                    return true;
                  });
 
-    // make_call for setting pd gains (by name)
     ds.make_call(r.name + "::SetPDGainsByName",
                  [this, &r](const std::string & jn, double p, double d)
                  {
@@ -650,12 +415,9 @@ void MjSimImpl::makeDatastoreCalls()
                    return true;
                  });
 
-    // make_call for reading pd gains (for all joints)
     ds.make_call(r.name + "::GetPDGains",
                  [this, &r](std::vector<double> & p_vec, std::vector<double> & d_vec)
                  {
-                   p_vec.resize(0);
-                   d_vec.resize(0);
                    p_vec = r.kp;
                    d_vec = r.kd;
                    const auto & rjo = controller->robots().robot(r.name).module().ref_joint_order();
@@ -674,7 +436,6 @@ void MjSimImpl::makeDatastoreCalls()
                    return true;
                  });
 
-    // make_call for reading pd gains (by name)
     ds.make_call(r.name + "::GetPDGainsByName",
                  [this, &r](const std::string & jn, double & p, double & d)
                  {
@@ -691,55 +452,6 @@ void MjSimImpl::makeDatastoreCalls()
                    d = r.kd[rjo_idx];
                    return true;
                  });
-
-    // make_call to set applied external force to a body of a robot (by name)
-    ds.make_call(
-        r.name + "::ApplyForcesOnBody",
-        [this, &r](const std::string & bodyname, const sva::ForceVecd & wrench, const Eigen::Vector3d localPoint)
-        {
-          auto & robot = controller->robots().robot(r.name);
-          if(robot.hasBody(bodyname))
-          {
-            auto mjr_body_idx = mj_name2id(model, mjOBJ_BODY, (r.prefixed(bodyname)).c_str());
-            if(mjr_body_idx < 0)
-            {
-              mc_rtc::log::warning(
-                  "[mc_mujoco] {}::ApplyForcesOnBody failed. MuJoCo body {} could not be found for robot body {}",
-                  r.name, r.prefixed(bodyname), bodyname);
-              return false;
-            }
-            mc_rtc::log::info(
-                "[mc_mujoco] {}::ApplyForcesOnBody queued body={} mj_body_id={} local_point=[{:.3f}, {:.3f}, {:.3f}] "
-                "force=[{:.3f}, {:.3f}, {:.3f}] moment=[{:.3f}, {:.3f}, {:.3f}]",
-                r.name, bodyname, mjr_body_idx, localPoint.x(), localPoint.y(), localPoint.z(), wrench.force().x(),
-                wrench.force().y(), wrench.force().z(), wrench.couple().x(), wrench.couple().y(), wrench.couple().z());
-            pending_body_forces_.push_back({mjr_body_idx, r.name, bodyname, wrench, localPoint});
-            return true;
-          }
-          else
-          {
-            mc_rtc::log::warning("[mc_mujoco] {}::ApplyForcesOnBody failed. Robot does not have any body called {}",
-                                 r.name, bodyname);
-            return false;
-          }
-        });
-
-    ds.make_call(r.name + "::GetApplyForcesOnBodyAudit",
-                 [this, &r](const std::string & bodyname, Eigen::Vector3d & bodyOrigin, Eigen::Vector3d & bodyCom,
-                            Eigen::Vector3d & worldPoint, sva::ForceVecd & requestedWrench, sva::ForceVecd & xfrcWrench)
-                 {
-                   const auto it = last_applied_body_force_audit_.find(r.name + "::" + bodyname);
-                   if(it == last_applied_body_force_audit_.end() || !it->second.valid)
-                   {
-                     return false;
-                   }
-                   bodyOrigin = it->second.body_origin;
-                   bodyCom = it->second.body_com;
-                   worldPoint = it->second.world_point;
-                   requestedWrench = it->second.requested_wrench;
-                   xfrcWrench = it->second.xfrc_wrench;
-                   return true;
-                 });
   }
 }
 
@@ -747,14 +459,15 @@ void MjSimImpl::startSimulation()
 {
   if(!config.with_controller)
   {
-    setSimulationInitialState();
     controller.reset();
     return;
   }
 
   makeDatastoreCalls();
 
-  // get sim timestep and set the frameskip parameter
+  // frameskip_ is computed from the local model's timestep, which mirrors whatever URLab's mjOption.timestep
+  // currently is (URLab may override this server-side via set_sim_options; if you change it there, restart
+  // mc_mujoco so the local mirror and frameskip stay in sync).
   double simTimestep = model->opt.timestep;
   frameskip_ = std::round(controller->timestep() / simTimestep);
   mc_rtc::log::info("[mc_mujoco] MC-RTC timestep: {}. MJ timestep: {}", controller->timestep(), simTimestep);
@@ -764,8 +477,6 @@ void MjSimImpl::startSimulation()
   {
     r.initialize(model, controller->robot(r.name));
     controller->setEncoderValues(r.name, r.encoders);
-    controller->setEncoderVelocities(r.name, r.alphas);
-    controller->setJointTorques(r.name, r.torques);
   }
   for(const auto & r : robots)
   {
@@ -774,72 +485,70 @@ void MjSimImpl::startSimulation()
   }
   controller->init(init_qs_, init_pos_);
   controller->running = true;
-  setSimulationInitialState();
 }
 
-void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model, mjData * data)
+void MjRobot::updateSensors(mc_control::MCGlobalController * gc,
+                            mjModel * model,
+                            mjData * data,
+                            const URLabArticulationObs & obs)
 {
-  // for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
-  // {
-  //   if(mj_jnt_to_rjo[i] == -1)
-  //   {
-  //     continue;
-  //   }
-  //   encoders[mj_jnt_to_rjo[i]] = data->qpos[model->jnt_qposadr[mj_jnt_ids[i]]];
-  //   alphas[mj_jnt_to_rjo[i]] = data->qvel[model->jnt_dofadr[mj_jnt_ids[i]]];
-  // }
-
+  // Push URLab's reported qpos/qvel into the local mjData mirror so mj_forward can recompute everything
+  // derived (xpos, sensordata, qfrc_actuator, ...) the way the original local-stepping code relied on.
+  // obs.qpos/obs.qvel are the full compiled-order vectors (same compiled model as our local mirror, see
+  // mujoco_init), so jnt_qposadr/jnt_dofadr indices from our local model are valid indices into them.
   for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
   {
-    if(mj_jnt_to_rjo[i] == -1)
+    if(mj_jnt_ids[i] == -1)
     {
       continue;
     }
-    // For mimic joints (no motor, driven by MuJoCo equality constraints),
-    // do NOT feed back the MuJoCo-driven position. Instead keep the value
-    // consistent with what the controller commanded, so the QP state in
-    // runClosedLoop() is never corrupted by equality-constraint-driven motion
-    // that mc-rtc does not model.
-    if(mj_mot_ids[i] == -1 && mj_pos_act_ids[i] == -1 && mj_vel_act_ids[i] == -1)
+    int adr = model->jnt_qposadr[mj_jnt_ids[i]];
+    if(adr < static_cast<int>(obs.qpos.size()))
     {
-      // This joint has no actuator in MuJoCo — it is driven by an equality
-      // constraint. Leave its encoder slot at the last commanded value so
-      // the observer does not inject an inconsistent state into the QP.
+      data->qpos[adr] = obs.qpos[adr];
+    }
+  }
+  for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
+  {
+    if(mj_jnt_ids[i] == -1)
+    {
+      continue;
+    }
+    int adr = model->jnt_dofadr[mj_jnt_ids[i]];
+    if(adr < static_cast<int>(obs.qvel.size()))
+    {
+      data->qvel[adr] = obs.qvel[adr];
+    }
+  }
+
+  for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
+  {
+    if(mj_jnt_to_rjo[i] == -1 || mj_jnt_ids[i] == -1)
+    {
       continue;
     }
     encoders[mj_jnt_to_rjo[i]] = data->qpos[model->jnt_qposadr[mj_jnt_ids[i]]];
     alphas[mj_jnt_to_rjo[i]] = data->qvel[model->jnt_dofadr[mj_jnt_ids[i]]];
   }
-
-  // for(size_t i = 0; i < mj_mot_ids.size(); ++i)
-  // {
-  //   if(mj_jnt_to_rjo[i] == -1)
-  //   {
-  //     continue;
-  //   }
-  //   torques[mj_jnt_to_rjo[i]] = data->qfrc_actuator[model->jnt_dofadr[mj_jnt_ids[i]]];
-  // }
-
-  for(size_t i = 0; i < mj_mot_ids.size(); ++i)
+  // qfrc_actuator is only valid after mj_forward has run on the freshly-written qpos/qvel; the caller
+  // (MjSimImpl::updateData) calls mj_forward once for all robots before torques are read out, so we read
+  // it here on the *next* updateSensors call (one control-tick of latency, matching the original
+  // local-stepping code's qfrc_actuator read which was likewise post-step).
+  for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
   {
-    if(mj_jnt_to_rjo[i] == -1)
-    {
-      continue;
-    }
-    // Skip joints with no motor — they have no meaningful actuator torque
-    if(mj_mot_ids[i] == -1)
+    if(mj_jnt_to_rjo[i] == -1 || mj_jnt_ids[i] == -1)
     {
       continue;
     }
     torques[mj_jnt_to_rjo[i]] = data->qfrc_actuator[model->jnt_dofadr[mj_jnt_ids[i]]];
   }
+
   if(!gc)
   {
     return;
   }
   auto & robot = gc->controller().robots().robot(name);
 
-  // Body sensor updates
   if(root_qpos_idx != -1)
   {
     root_pos = Eigen::Map<Eigen::Vector3d>(&data->qpos[root_qpos_idx]);
@@ -859,18 +568,15 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
       gc->setSensorLinearVelocities(name, {{"FloatingBase", root_linvel}});
       gc->setSensorAngularVelocities(name, {{"FloatingBase", root_angvel}});
       gc->setSensorLinearAccelerations(name, {{"FloatingBase", root_linacc}});
-      gc->setSensorAngularAccelerations(name, {{"FloatingBase", root_angacc}});
     }
   }
 
-  // Gyro update
   for(auto & gyro : gyros)
   {
     mujoco_get_sensordata(*model, *data, mc_bs_to_mj_gyro_id[gyro.first], gyro.second.data());
   }
   gc->setSensorAngularVelocities(name, gyros);
 
-  // Accelerometers update
   for(auto & accelerometer : accelerometers)
   {
     mujoco_get_sensordata(*model, *data, mc_bs_to_mj_accelerometer_id[accelerometer.first],
@@ -878,7 +584,6 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
   }
   gc->setSensorLinearAccelerations(name, accelerometers);
 
-  // Force sensor update
   for(auto & fs : wrenches)
   {
     mujoco_get_sensordata(*model, *data, mc_fs_to_mj_fsensor_id[fs.first], fs.second.force().data());
@@ -887,18 +592,33 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
   }
   gc->setWrenches(name, wrenches);
 
-  // Joint sensor updates
   gc->setEncoderValues(name, encoders);
   gc->setEncoderVelocities(name, alphas);
   gc->setJointTorques(name, torques);
 }
 
-void MjSimImpl::updateData()
+void MjSimImpl::updateData(const URLabStepResult & result)
 {
+  wallclock = result.time;
+  // Note: URLabClient::parseStepResult does not currently parse the reply's "entities" block, so
+  // non-articulated MjObject poses are not refreshed here and stay at their last-known value. Extend
+  // URLabStepResult with an "entities" map (and parse it in updateData) if a controller needs live prop
+  // poses via getObjectPosW.
   for(auto & r : robots)
   {
-    r.updateSensors(controller.get(), model, data);
+    auto it = result.per_articulation.find(r.prefix);
+    if(it == result.per_articulation.end())
+    {
+      mc_rtc::log::warning("[mc_mujoco] No observation for articulation '{}' (prefix '{}') in step reply", r.name,
+                           r.prefix);
+      continue;
+    }
+    r.updateSensors(controller.get(), model, data, it->second);
   }
+  // Recompute every quantity derived from qpos/qvel (xpos, sensordata, qfrc_actuator, ...) for the
+  // values we just wrote, without integrating: this is the local-mirror equivalent of what mj_step used
+  // to do as a side effect, but URLab is the one actually integrating physics.
+  mj_forward(model, data);
 }
 
 void MjRobot::updateControl(const mc_rbdyn::Robot & robot)
@@ -920,83 +640,47 @@ void MjRobot::updateControl(const mc_rbdyn::Robot & robot)
   }
 }
 
-void MjRobot::sendControl(const mjModel & model,
-                          mjData & data,
+void MjRobot::sendControl(std::map<std::string, double> & out_ctrl_map,
                           size_t interp_idx,
                           size_t frameskip_,
                           bool torque_control)
 {
-  for(size_t i = 0; i < mj_ctrl.size(); ++i)
+  for(size_t i = 0; i < mj_act_names.size(); ++i)
   {
-    auto mot_id = mj_mot_ids[i];
-    auto pos_act_id = mj_pos_act_ids[i];
-    auto vel_act_id = mj_vel_act_ids[i];
+    if(mj_act_names[i].empty())
+    {
+      continue;
+    }
     auto rjo_id = mj_jnt_to_rjo[i];
     if(rjo_id == -1)
     {
       continue;
     }
-    // compute desired q using interpolation
     double q_ref = (interp_idx + 1) * (mj_next_ctrl_q[i] - mj_prev_ctrl_q[i]) / frameskip_;
     q_ref += mj_prev_ctrl_q[i];
-    // compute desired alpha using interpolation
     double alpha_ref = (interp_idx + 1) * (mj_next_ctrl_alpha[i] - mj_prev_ctrl_alpha[i]) / frameskip_;
     alpha_ref += mj_prev_ctrl_alpha[i];
-    // compute desired jointTorque using interpolation
     double torque_ref = (interp_idx + 1) * (mj_next_ctrl_jointTorque[i] - mj_prev_ctrl_jointTorque[i]) / frameskip_;
     torque_ref += mj_prev_ctrl_jointTorque[i];
-    if(mot_id != -1)
-    {
-      if(torque_control && !mj_is_gripper_joint[i])
-      {
-        mj_ctrl[i] = torque_ref;
-      }
-      else
-      {
-        mj_ctrl[i] = PD(rjo_id, q_ref, encoders[rjo_id], alpha_ref, alphas[rjo_id]);
-      }
-      double ratio = model.actuator_gear[6 * mot_id];
-      data.ctrl[mot_id] = mj_ctrl[i] / ratio;
-    }
-    if(pos_act_id != -1)
-    {
-      data.ctrl[pos_act_id] = q_ref;
-    }
-    if(vel_act_id != -1)
-    {
-      data.ctrl[vel_act_id] = alpha_ref;
-    }
-  }
-  if(mj_general_act_id != -1 && mj_general_act_ctrl_idx != -1)
-  {
-    const auto i = static_cast<size_t>(mj_general_act_ctrl_idx);
-    double q_ref = (interp_idx + 1) * (mj_next_ctrl_q[i] - mj_prev_ctrl_q[i]) / frameskip_;
-    q_ref += mj_prev_ctrl_q[i];
 
-    const auto joint_id = mj_jnt_ids[i];
-    const double joint_low = model.jnt_range[2 * joint_id];
-    const double joint_high = model.jnt_range[2 * joint_id + 1];
-    const double ctrl_low = model.actuator_ctrlrange[2 * mj_general_act_id];
-    const double ctrl_high = model.actuator_ctrlrange[2 * mj_general_act_id + 1];
-
-    double ctrl = ctrl_low;
-    if(joint_high > joint_low)
+    double cmd;
+    if(torque_control && torque_ref != 0)
     {
-      const double ratio = (q_ref - joint_low) / (joint_high - joint_low);
-      ctrl = ctrl_low + ratio * (ctrl_high - ctrl_low);
+      cmd = torque_ref;
     }
-    data.ctrl[mj_general_act_id] = std::clamp(ctrl, ctrl_low, ctrl_high);
+    else
+    {
+      cmd = PD(rjo_id, q_ref, encoders[rjo_id], alpha_ref, alphas[rjo_id]);
+    }
+    out_ctrl_map[mj_act_names[i]] = cmd;
   }
 }
 
-bool MjSimImpl::controlStep()
+bool MjSimImpl::controlStep(std::map<std::string, std::map<std::string, double>> & out_per_articulation_ctrl)
 {
   auto interp_idx = iterCount_ % frameskip_;
-  // After every frameskip iters
   if(config.with_controller && interp_idx == 0)
   {
-    pending_body_forces_.clear();
-    // run the controller
     if(!controller->run())
     {
       return true;
@@ -1006,14 +690,9 @@ bool MjSimImpl::controlStep()
       r.updateControl(controller->robots().robot(r.name));
     }
   }
-  if(controller->controller().datastore().has("ControlMode"))
-  {
-    config.torque_control = controller->controller().datastore().get<std::string>("ControlMode").compare("Torque") == 0;
-  }
-  // On each control iter
   for(auto & r : robots)
   {
-    r.sendControl(*model, *data, interp_idx, frameskip_, config.torque_control);
+    r.sendControl(out_per_articulation_ctrl[r.prefix], interp_idx, frameskip_, config.torque_control);
   }
   iterCount_++;
   return false;
@@ -1021,45 +700,14 @@ bool MjSimImpl::controlStep()
 
 void MjSimImpl::simStep()
 {
-  // clear old perturbations, apply new
-  mju_zero(data->xfrc_applied, 6 * model->nbody);
-  mjv_applyPerturbPose(model, data, &pert, 0); // move mocap bodies only
-  mjv_applyPerturbForce(model, data, &pert);
-
-  for(const auto & pending : pending_body_forces_)
-  {
-    Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> bodyRotation(data->xmat + 9 * pending.body_id);
-    Eigen::Map<Eigen::Vector3d> bodyOrigin(data->xpos + 3 * pending.body_id);
-    Eigen::Map<Eigen::Vector3d> bodyCom(data->xipos + 3 * pending.body_id);
-    Eigen::Map<Eigen::Matrix<double, 6, 1>> bodyWrench(data->xfrc_applied + 6 * pending.body_id);
-
-    Eigen::Vector3d worldPoint = bodyOrigin + bodyRotation * pending.localPoint;
-    Eigen::Vector3d totalTorque = pending.wrench.couple() + (worldPoint - bodyCom).cross(pending.wrench.force());
-    bodyWrench.head<3>() += pending.wrench.force();
-    bodyWrench.tail<3>() += totalTorque;
-    mc_rtc::log::info("[mc_mujoco] ApplyForcesOnBody injected mj_body_id={} world_point=[{:.3f}, {:.3f}, {:.3f}] "
-                      "xfrc(force,torque)=[{:.3f}, {:.3f}, {:.3f}; {:.3f}, {:.3f}, {:.3f}]",
-                      pending.body_id, worldPoint.x(), worldPoint.y(), worldPoint.z(), bodyWrench[0], bodyWrench[1],
-                      bodyWrench[2], bodyWrench[3], bodyWrench[4], bodyWrench[5]);
-
-    LastAppliedBodyForceAudit audit;
-    audit.valid = true;
-    audit.body_id = pending.body_id;
-    audit.body_name = pending.body_name;
-    audit.body_origin = bodyOrigin;
-    audit.body_com = bodyCom;
-    audit.world_point = worldPoint;
-    audit.requested_wrench = pending.wrench;
-    audit.xfrc_wrench = sva::ForceVecd(bodyWrench.tail<3>(), bodyWrench.head<3>());
-    last_applied_body_force_audit_[pending.robot_name + "::" + pending.body_name] = audit;
-  }
-
-  // take one step in simulation
-  // model.opt.timestep will be used here
-  mj_step(model, data);
-  mju_zero(data->qfrc_applied, model->nv);
-
-  wallclock = data->time;
+  std::map<std::string, std::map<std::string, double>> per_articulation_ctrl;
+  // controlStep computes one sub-step's command for every robot (interpolated between the previous and
+  // next mc_rtc control setpoint). We then send exactly one physics step to URLab per simStep() call so
+  // the interpolation stays meaningful; the outer loop (stepSimulation) calls this frameskip_ times per
+  // mc_rtc control tick, matching the original local-stepping cadence.
+  controlStep(per_articulation_ctrl);
+  auto result = urlab->step(per_articulation_ctrl, 1);
+  updateData(result);
 }
 
 void MjSimImpl::resetSimulation(const std::map<std::string, std::vector<double>> & reset_qs,
@@ -1076,13 +724,30 @@ void MjSimImpl::resetSimulation(const std::map<std::string, std::vector<double>>
     }
     controller->running = true;
   }
-  mj_resetData(model, data);
-  setSimulationInitialState();
-  makeDatastoreCalls();
-  for(auto & marker : markers)
+
+  std::map<std::string, std::map<std::string, double>> per_articulation_qpos;
+  for(const auto & [robot_name, qs] : reset_qs)
   {
-    marker.marker.pose(getObjectPosW(marker.name));
+    auto it = std::find_if(robots.begin(), robots.end(), [&](const auto & r) { return r.name == robot_name; });
+    if(it == robots.end())
+    {
+      continue;
+    }
+    const auto & rjo = controller->robots().robot(robot_name).module().ref_joint_order();
+    auto & qpos_map = per_articulation_qpos[it->prefix];
+    for(size_t i = 0; i < it->mj_jnt_names.size(); ++i)
+    {
+      auto rjo_idx = it->mj_jnt_to_rjo[i];
+      if(rjo_idx == -1 || rjo_idx >= static_cast<int>(qs.size()) || it->mj_jnt_names[i].empty())
+      {
+        continue;
+      }
+      qpos_map[it->mj_jnt_names[i]] = qs[rjo_idx];
+    }
   }
+  auto result = urlab->reset("", per_articulation_qpos);
+  updateData(result);
+  makeDatastoreCalls();
 }
 
 bool MjSimImpl::stepSimulation()
@@ -1092,10 +757,8 @@ bool MjSimImpl::stepSimulation()
     resetSimulation(init_qs_, init_pos_);
   }
   auto start_step = clock::now();
-  // Only run the GUI update if the simulation is paused
   if(config.step_by_step && rem_steps == 0)
   {
-    mj_kinematics(model, data);
     if(controller)
     {
       controller->running = false;
@@ -1113,27 +776,21 @@ bool MjSimImpl::stepSimulation()
     mj_sim_dt[(iterCount_ - 1) % mj_sim_dt.size()] = dt.count();
   }
   mj_sim_start_t = start_step;
-  auto do_step = [this, &start_step]()
-  {
-    {
-      std::lock_guard<std::mutex> lock(rendering_mutex_);
-      simStep();
-    }
-    updateData();
-    return controlStep();
-  };
   bool done = false;
   if(!config.step_by_step)
   {
-    done = do_step();
+    // Note: unlike the original local-stepping implementation, simStep() now blocks on a URLab RPC
+    // round-trip rather than a near-instant local mj_step. If that round-trip exceeds the control
+    // timestep, sync_real_time's sleep_until below will simply return immediately (no harm done), but
+    // it can no longer guarantee tight real-time pacing -- URLab's own physics rate is the actual
+    // bottleneck in that case.
+    simStep();
   }
   if(config.step_by_step && rem_steps > 0)
   {
-    // Doing 'frameskip_' steps of sim + control
-    // (But controller.run() will execute only when interp_idx == 0)
     for(size_t i = 0; i < frameskip_; i++)
     {
-      done = do_step() && done;
+      simStep();
     }
     rem_steps--;
   }
@@ -1144,59 +801,22 @@ bool MjSimImpl::stepSimulation()
   return done;
 }
 
-void MjSimImpl::updateScene()
-{
-  // update scene and render
-  std::lock_guard<std::mutex> lock(rendering_mutex_);
-  mjv_updateScene(model, data, &options, &pert, &camera, mjCAT_ALL, &scene);
-
-  if(client)
-  {
-    client->updateScene(scene);
-  }
-
-  // process pending GUI events, call GLFW callbacks
-  glfwPollEvents();
-}
-
 bool MjSimImpl::render()
 {
-  if(!config.with_visualization)
+  if(!config.with_mc_rtc_gui || !window)
   {
     return true;
   }
 
-  // mj render
-#ifdef USE_UI_ADAPTER
-  mjr_render(platform_ui_adapter->state().rect[0], &scene, &platform_ui_adapter->mjr_context());
-#else
-  mjr_render(uistate.rect[0], &scene, &context);
-#endif
-
-  // Render ImGui
   ImGui_ImplOpenGL3_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
-  ImGuizmo::BeginFrame();
   ImGuiIO & io = ImGui::GetIO();
-  ImGuizmo::AllowAxisFlip(false);
-  ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+
   if(client)
   {
     client->update();
-#ifdef USE_UI_ADAPTER
-    client->draw2D(*platform_ui_adapter);
-#else
     client->draw2D(window);
-#endif
-    client->draw3D();
-    for(auto & [name, marker] : markers)
-    {
-      if(marker.draw(client->view(), client->projection()) || marker.active())
-      {
-        setObjectPosW(name, marker.pose());
-      }
-    }
   }
   {
     auto right_margin = 5.0f;
@@ -1205,20 +825,17 @@ bool MjSimImpl::render()
     auto height = io.DisplaySize.y - 2 * top_margin;
     ImGui::SetNextWindowPos({0.8f * width - right_margin, top_margin}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({0.2f * width, 0.3f * height}, ImGuiCond_FirstUseEver);
-#if mjVERSION_HEADER <= 210
-    ImGui::Begin(fmt::format("mc_mujoco (MuJoCo {})", mj_version()).c_str());
-#else
-    ImGui::Begin(fmt::format("mc_mujoco (MuJoCo {})", mj_versionString()).c_str());
-#endif
+    ImGui::Begin(fmt::format("mc_mujoco (URLab bridge, MuJoCo {})", model ? mj_versionString() : "?").c_str());
     size_t nsamples = std::min(mj_sim_dt.size(), iterCount_);
     mj_sim_dt_average = 0;
     for(size_t i = 0; i < nsamples; ++i)
     {
       mj_sim_dt_average += mj_sim_dt[i] / nsamples;
     }
-    ImGui::Text("Average sim time: %.2fμs", mj_sim_dt_average);
+    ImGui::Text("Average step() round-trip: %.2fus", mj_sim_dt_average);
     ImGui::Text("Simulation/Real time: %.2f", mj_sim_dt_average / (1e6 * model->opt.timestep));
-    ImGui::Text("Wallclock time: %.2fs", wallclock);
+    ImGui::Text("Wallclock time (URLab): %.2fs", wallclock);
+    ImGui::Text("URLab endpoint: %s", config.urlab_endpoint.c_str());
     if(ImGui::Checkbox("Sync with real-time", &config.sync_real_time))
     {
       if(config.sync_real_time)
@@ -1247,157 +864,27 @@ bool MjSimImpl::render()
       doNStepsButton(50, false);
       doNStepsButton(100, true);
     }
-    auto flag_to_gui = [&](const char * label, mjtVisFlag flag)
-    {
-      bool show = options.flags[flag];
-      if(ImGui::Checkbox(label, &show))
-      {
-        options.flags[flag] = show;
-      }
-    };
-    flag_to_gui("Show contact points [C]", mjVIS_CONTACTPOINT);
-    flag_to_gui("Show contact forces [F]", mjVIS_CONTACTFORCE);
-    flag_to_gui("Make Transparent [T]", mjVIS_TRANSPARENT);
-    flag_to_gui("Convex Hull rendering [V]", mjVIS_CONVEXHULL);
-    if(client)
-    {
-      ImGui::Checkbox("Show mc_rtc visuals", &client->show_visuals);
-    }
-    auto group_to_checkbox = [&](size_t group, bool last)
-    {
-      bool show = options.geomgroup[group];
-      if(ImGui::Checkbox(fmt::format("{}", group).c_str(), &show))
-      {
-        options.geomgroup[group] = show;
-      }
-      if(!last)
-      {
-        ImGui::SameLine();
-      }
-    };
-    ImGui::Text("%s", fmt::format("Visible layers [0-{}]", mjNGROUP).c_str());
-    for(size_t i = 0; i < mjNGROUP; ++i)
-    {
-      group_to_checkbox(i, i == mjNGROUP - 1);
-    }
     if(ImGui::Button("Reset simulation", ImVec2(-FLT_MIN, 0.0f)))
     {
       reset_simulation_ = true;
-    }
-    for(const auto & o : objects)
-    {
-      auto it = std::find_if(markers.begin(), markers.end(), [&](const auto & m) { return m.name == o.name; });
-      bool active = (it != markers.end());
-      if(ImGui::Checkbox(fmt::format("Set {} position", o.name).c_str(), &active))
-      {
-        if(!active)
-        {
-          markers.erase(it);
-        }
-        else
-        {
-          markers.push_back(MjObjectMarker{o.name, {getObjectPosW(o.name), ControlAxis::ALL}});
-        }
-      }
     }
     ImGui::End();
   }
   ImGui::Render();
   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-  // swap OpenGL buffers (blocking call due to v-sync)
-#ifdef USE_UI_ADAPTER
-  platform_ui_adapter->SwapBuffers();
-#else
   glfwSwapBuffers(window);
-#endif
+  glfwPollEvents();
 
-#ifdef USE_UI_ADAPTER
-  return !platform_ui_adapter->ShouldCloseWindow();
-#else
   return !glfwWindowShouldClose(window);
-#endif
 }
 
 void MjSimImpl::stopSimulation() {}
 
 void MjSimImpl::saveGUISettings()
 {
-  auto user_path = fs::path(USER_FOLDER);
-  if(!fs::exists(user_path))
-  {
-    if(!fs::create_directories(user_path))
-    {
-      mc_rtc::log::critical("Failed to create the user directory: {}. GUI configuration will not be saved",
-                            user_path.string());
-      return;
-    }
-  }
-
-  auto config_path = fmt::format("{}/mc_mujoco.yaml", USER_FOLDER);
-  auto config = [&]() -> mc_rtc::Configuration
-  {
-    if(fs::exists(config_path))
-    {
-      return {config_path};
-    }
-    return {};
-  }();
-
-  auto camera_c = config.add("camera");
-  camera_c.add("type", camera.type);
-  camera_c.add("fixedcamid", camera.fixedcamid);
-  camera_c.add("trackbodyid", camera.trackbodyid);
-  auto lookat = camera_c.array("lookat", 3);
-  for(size_t i = 0; i < 3; ++i)
-  {
-    lookat.push(camera.lookat[i]);
-  }
-  camera_c.add("distance", camera.distance);
-  camera_c.add("azimuth", camera.azimuth);
-  camera_c.add("elevation", camera.elevation);
-  auto visualize_c = config.add("visualize");
-  visualize_c.add("collisions", static_cast<bool>(options.geomgroup[0]));
-  visualize_c.add("visuals", static_cast<bool>(options.geomgroup[1]));
-  visualize_c.add("contact-points", static_cast<bool>(options.flags[mjVIS_CONTACTPOINT]));
-  visualize_c.add("contact-forces", static_cast<bool>(options.flags[mjVIS_CONTACTFORCE]));
-  visualize_c.add("contact-split", static_cast<bool>(options.flags[mjVIS_CONTACTSPLIT]));
-  config.save(config_path);
-  mc_rtc::log::success("[mc_mujoco] Configuration saved to {}", config_path);
-}
-
-void MjSimImpl::loadPlugins(const mc_rtc::Configuration & mc_mujoco_cfg) const
-{
-  // print built-in plugins
-  int nplugin = mjp_pluginCount();
-  if(nplugin)
-  {
-    mc_rtc::log::info("[mc_mujoco] Built-in plugins");
-    for(int i = 0; i < nplugin; ++i)
-    {
-      mc_rtc::log::info("  - {}", mjp_getPluginAtSlot(i)->name);
-    }
-  }
-
-  // scan plugins from the user-specified paths
-  for(const auto & plugin_path : mc_mujoco_cfg("PluginPaths", std::vector<std::string>{}))
-  {
-    mc_rtc::log::info("[mc_mujoco] Scan plugins in {}", plugin_path);
-    mj_loadAllPluginLibraries(
-        plugin_path.c_str(),
-        +[](const char * filename, int first, int count)
-        {
-          if(count == 0)
-          {
-            return;
-          }
-          mc_rtc::log::info("[mc_mujoco] Plugins registered by library {}", filename);
-          for(int i = first; i < first + count; ++i)
-          {
-            mc_rtc::log::info("  - {}", mjp_getPluginAtSlot(i)->name);
-          }
-        });
-  }
+  // No 3D camera/visualization state to persist anymore (URLab owns the viewport); kept as a no-op entry
+  // point in case future GUI panel settings need persisting.
 }
 
 MjSim::MjSim(const MjConfiguration & config) : impl(new MjSimImpl(config))
@@ -1415,20 +902,15 @@ bool MjSim::stepSimulation()
   return impl->stepSimulation();
 }
 
-void MjSim::stopSimulation()
-{
-  impl->stopSimulation();
-}
-
-void MjSim::updateScene()
-{
-  impl->updateScene();
-}
-
 void MjSim::resetSimulation(const std::map<std::string, std::vector<double>> & reset_qs,
                             const std::map<std::string, sva::PTransformd> & reset_pos)
 {
   impl->resetSimulation(reset_qs, reset_pos);
+}
+
+void MjSim::stopSimulation()
+{
+  impl->stopSimulation();
 }
 
 bool MjSim::render()

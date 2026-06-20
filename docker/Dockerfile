@@ -40,7 +40,9 @@ RUN apt-get update && apt-get install -y \
     libtasks-dev libtvm-dev libeigen-quadprog-dev libstate-observation-dev \
     libndcurves-dev libmesh-sampling-dev libgeos++-inline-dev \
     mc-rtc-data \
-    # Graphics/X11
+    # URLab bridge transport/encoding (ZMQ RPC client + msgpack wire format)
+    libzmq3-dev \
+    # Graphics/X11 (mc_rtc GUI is a small 2D ImGui panel; no 3D MuJoCo viewport is rendered)
     mesa-utils libgl1-mesa-dri libglx-mesa0 libgl1-mesa-glx x11-apps \
     libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libglew-dev \
     libgeos++-dev \
@@ -88,36 +90,24 @@ RUN --mount=type=cache,target=/root/.ccache \
     ldconfig && \
     rm -rf /tmp/mc_rtc
 
-# Build the mc_rtc-ecosystem libraries that example controllers depend on
-# (BaselineWalkingController and its transitive deps). Pinned via
-# examples/MC_RTC_DEPS_VERSION — bump that file to invalidate this stack.
-# SHAs match grasp-fsm-sample-controller/README.md "Tested with" table.
-COPY docker/build-cmake-dep.sh /usr/local/bin/build-cmake-dep
-RUN chmod +x /usr/local/bin/build-cmake-dep
-COPY examples/MC_RTC_DEPS_VERSION /tmp/MC_RTC_DEPS_VERSION
 
+# cppzmq (header-only C++ binding for libzmq) and msgpack-c (modern C++17 API, the
+# Ubuntu-packaged libmsgpack-dev predates the msgpack::object/sbuffer API urlab_client.cpp uses)
 RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/arntanguy/gram_savitzky_golay.git
+    git clone --depth=1 --branch v4.10.0 https://github.com/zeromq/cppzmq.git /tmp/cppzmq && \
+    cmake -S /tmp/cppzmq -B /tmp/cppzmq/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCPPZMQ_BUILD_TESTS=OFF && \
+    cmake --build /tmp/cppzmq/build && \
+    cmake --install /tmp/cppzmq/build && \
+    rm -rf /tmp/cppzmq
 RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/jrl-umi3218/mc_state_observation.git
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/QpSolverCollection.git \
-        42cb58674e692bea0bf64c7ab7a4a80137023aee -DENABLE_QUADPROG=ON
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/TrajectoryCollection.git \
-        3f18e7a8748e40dbccdd28b0b3ec98353a33f58d
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/ForceControlCollection.git \
-        55de5119347987e9e3bc76783aec439748202cf5
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/NMPC.git \
-        d88792ccb1a77e78bca7572ba2afd35b0418cd71
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/CentroidalControlCollection.git \
-        a874f6a09e4f1431509c166fb622af25781fe396
-RUN --mount=type=cache,target=/root/.ccache \
-    build-cmake-dep https://github.com/isri-aist/BaselineWalkingController.git \
-        9cba7e2fcc95b990774599f405471b86cc0f9e07
+    git clone --depth=1 --branch cpp-6.1.1 https://github.com/msgpack/msgpack-c.git /tmp/msgpack-c && \
+    cmake -S /tmp/msgpack-c -B /tmp/msgpack-c/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DMSGPACK_BUILD_EXAMPLES=OFF -DMSGPACK_BUILD_TESTS=OFF \
+        -DMSGPACK_USE_BOOST=OFF && \
+    cmake --build /tmp/msgpack-c/build && \
+    cmake --install /tmp/msgpack-c/build && \
+    rm -rf /tmp/msgpack-c
 
 # Install MuJoCo (cached — update MUJOCO_VERSION to re-download)
 COPY MUJOCO_VERSION /tmp/MUJOCO_VERSION

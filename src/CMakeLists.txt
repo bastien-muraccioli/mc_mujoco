@@ -1,62 +1,14 @@
-set(uitools_is_platform_ui_adapter OFF)
-if(EXISTS ${MUJOCO_INCLUDE_DIR}/uitools.c)
-  set(uitools_SRC ${MUJOCO_INCLUDE_DIR}/uitools.c
-                  ${MUJOCO_INCLUDE_DIR}/uitools.h)
-elseif(EXISTS ${MUJOCO_ROOT_DIR}/simulate/uitools.cc)
-  set(uitools_SRC
-      ${MUJOCO_ROOT_DIR}/simulate/glfw_dispatch.cc
-      ${MUJOCO_ROOT_DIR}/simulate/glfw_dispatch.h
-      ${MUJOCO_ROOT_DIR}/simulate/uitools.cc
-      ${MUJOCO_ROOT_DIR}/simulate/uitools.h)
-elseif(EXISTS ${MUJOCO_SAMPLE_DIR}/uitools.c)
-  set(uitools_SRC ${MUJOCO_SAMPLE_DIR}/uitools.c ${MUJOCO_SAMPLE_DIR}/uitools.h)
-else()
-  set(uitools_is_platform_ui_adapter ON)
-  set(OUR_GLFW_ADAPTER_HDR
-      ${CMAKE_CURRENT_BINARY_DIR}/include/our_glfw_adapter.h)
-  set(uitools_SRC
-      ${MUJOCO_ROOT_DIR}/simulate/glfw_dispatch.cc
-      ${MUJOCO_ROOT_DIR}/simulate/glfw_dispatch.h
-      ${MUJOCO_ROOT_DIR}/simulate/glfw_adapter.cc
-      ${MUJOCO_ROOT_DIR}/simulate/platform_ui_adapter.h
-      ${MUJOCO_ROOT_DIR}/simulate/platform_ui_adapter.cc
-      ${OUR_GLFW_ADAPTER_HDR})
-  # Make private members public so we can access the window_ field
-  file(READ "${MUJOCO_ROOT_DIR}/simulate/glfw_adapter.h" GLFW_ADAPTER_SRC)
-  string(REPLACE "private:" "public:" GLFW_ADAPTER_SRC "${GLFW_ADAPTER_SRC}")
-  file(
-    GENERATE
-    OUTPUT "${OUR_GLFW_ADAPTER_HDR}"
-    CONTENT "${GLFW_ADAPTER_SRC}")
-endif()
-
 set(mc_mujoco_lib_SRC
     mj_configuration.h
     mj_sim.cpp
     mj_utils.cpp
-    mj_utils_merge_mujoco_models.cpp
     mj_sim.h
     mj_sim_impl.h
     mj_utils.h
-    ${uitools_SRC}
+    urlab_client.h
+    urlab_client.cpp
     MujocoClient.cpp
-    MujocoClient.h
-    widgets/Arrow.h
-    widgets/Force.h
-    widgets/MujocoWidget.h
-    widgets/Point3D.h
-    widgets/Polygon.h
-    widgets/Polyhedron.h
-    widgets/Rotation.h
-    widgets/Trajectory.h
-    widgets/Transform.h
-    widgets/Visual.h
-    widgets/Visual.cpp
-    widgets/XYTheta.h
-    widgets/details/ControlAxis.h
-    widgets/details/InteractiveMarker.h
-    widgets/details/InteractiveMarker.cpp
-    widgets/details/TransformBase.h)
+    MujocoClient.h)
 
 set(assets_DIR "${PROJECT_SOURCE_DIR}/assets")
 
@@ -77,40 +29,97 @@ set(implot_DIR "${PROJECT_SOURCE_DIR}/ext/implot")
 set(implot_SRC ${implot_DIR}/implot.h ${implot_DIR}/implot.cpp
                ${implot_DIR}/implot_items.cpp ${implot_DIR}/implot_demo.cpp)
 
-set(ImGuizmo_DIR ${PROJECT_SOURCE_DIR}/ext/ImGuizmo)
-set(ImGuizmo_SRC ${ImGuizmo_DIR}/ImGuizmo.h ${ImGuizmo_DIR}/ImGuizmo.cpp)
-
 set(mc_rtc-imgui_DIR "${PROJECT_SOURCE_DIR}/ext/mc_rtc-imgui")
 add_subdirectory("${mc_rtc-imgui_DIR}"
                  "${CMAKE_CURRENT_BINARY_DIR}/mc_rtc-imgui/")
 
 configure_file(config.in.h "${CMAKE_CURRENT_BINARY_DIR}/include/config.h")
 
+# URLab bridge dependencies: ZMQ (RPC transport) + msgpack-c (wire encoding).
+# Both are widely packaged; prefer the system package, fall back to FetchContent
+# if unavailable.
+find_package(ZeroMQ QUIET)
+if(NOT ZeroMQ_FOUND)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ZeroMQ QUIET IMPORTED_TARGET libzmq)
+  endif()
+endif()
+find_package(cppzmq QUIET)
+find_package(msgpack-cxx QUIET)
+if(NOT msgpack-cxx_FOUND)
+  find_package(msgpack QUIET)
+endif()
+
+if(NOT (ZeroMQ_FOUND OR TARGET PkgConfig::ZeroMQ)
+   OR NOT cppzmq_FOUND
+   OR NOT (msgpack-cxx_FOUND OR msgpack_FOUND))
+  message(
+    STATUS
+      "libzmq/cppzmq/msgpack-c not all found via find_package, fetching from source. "
+      "Install libzmq3-dev, cppzmq, and msgpack-cxx system packages to skip this."
+  )
+  include(FetchContent)
+  if(NOT (ZeroMQ_FOUND OR TARGET PkgConfig::ZeroMQ))
+    FetchContent_Declare(
+      libzmq
+      GIT_REPOSITORY https://github.com/zeromq/libzmq.git
+      GIT_TAG v4.3.5)
+    set(BUILD_TESTS
+        OFF
+        CACHE BOOL "" FORCE)
+    set(WITH_PERF_TOOL
+        OFF
+        CACHE BOOL "" FORCE)
+    set(ENABLE_CPACK
+        OFF
+        CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(libzmq)
+  endif()
+  if(NOT cppzmq_FOUND)
+    FetchContent_Declare(
+      cppzmq
+      GIT_REPOSITORY https://github.com/zeromq/cppzmq.git
+      GIT_TAG v4.10.0)
+    set(CPPZMQ_BUILD_TESTS
+        OFF
+        CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(cppzmq)
+  endif()
+  if(NOT (msgpack-cxx_FOUND OR msgpack_FOUND))
+    FetchContent_Declare(
+      msgpack-c
+      GIT_REPOSITORY https://github.com/msgpack/msgpack-c.git
+      GIT_TAG cpp-6.1.1)
+    set(MSGPACK_BUILD_EXAMPLES
+        OFF
+        CACHE BOOL "" FORCE)
+    set(MSGPACK_BUILD_TESTS
+        OFF
+        CACHE BOOL "" FORCE)
+    set(MSGPACK_USE_BOOST
+        OFF
+        CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(msgpack-c)
+  endif()
+endif()
+
 add_library(
   mc_mujoco_lib STATIC
-  ${mc_mujoco_lib_SRC}
-  ${imgui_SRC}
-  ${implot_SRC}
-  ${ImGuizmo_SRC}
-  ${mc_rtc-imgui-SRC}
-  ${mc_rtc-imgui-HDR}
-  $<TARGET_OBJECTS:pugixml>)
-if(uitools_is_platform_ui_adapter)
-  target_compile_definitions(mc_mujoco_lib PRIVATE USE_UI_ADAPTER)
-endif()
+  ${mc_mujoco_lib_SRC} ${imgui_SRC} ${implot_SRC} ${mc_rtc-imgui-SRC}
+  ${mc_rtc-imgui-HDR} $<TARGET_OBJECTS:pugixml>)
 target_include_directories(
   mc_mujoco_lib
   PUBLIC ${MUJOCO_INCLUDE_DIR} $<BUILD_INTERFACE:${MUJOCO_SAMPLE_DIR}>
-         $<BUILD_INTERFACE:${MUJOCO_SIMULATE_DIR}> $<INSTALL_INTERFACE:include>)
+         $<INSTALL_INTERFACE:include>)
 if(DEFINED MUJOCO_ROOT_INCLUDE_DIR)
   target_include_directories(mc_mujoco_lib PUBLIC ${MUJOCO_ROOT_INCLUDE_DIR})
 endif()
 target_include_directories(mc_mujoco_lib
                            PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
 target_include_directories(
-  mc_mujoco_lib
-  PRIVATE "${imgui_DIR}" "${implot_DIR}" "${mc_rtc-imgui_DIR}" "${assets_DIR}"
-          "${ImGuizmo_DIR}" "${PROJECT_SOURCE_DIR}/ext/pugixml")
+  mc_mujoco_lib PRIVATE "${imgui_DIR}" "${implot_DIR}" "${mc_rtc-imgui_DIR}"
+                        "${assets_DIR}" "${PROJECT_SOURCE_DIR}/ext/pugixml")
 target_link_libraries(
   mc_mujoco_lib PUBLIC mc_rtc::mc_control mc_rtc::mc_control_client
                        ${CMAKE_DL_LIBS})
@@ -143,12 +152,32 @@ else()
     install(FILES ${mc_mujoco_lib_combined_OUT} DESTINATION lib)
   endif()
 endif()
+
+# URLab bridge linkage
+if(TARGET libzmq)
+  target_link_libraries(mc_mujoco_lib PRIVATE libzmq)
+elseif(TARGET PkgConfig::ZeroMQ)
+  target_link_libraries(mc_mujoco_lib PRIVATE PkgConfig::ZeroMQ)
+else()
+  target_link_libraries(mc_mujoco_lib PRIVATE ${ZeroMQ_LIBRARIES})
+  target_include_directories(mc_mujoco_lib PRIVATE ${ZeroMQ_INCLUDE_DIRS})
+endif()
+if(TARGET cppzmq)
+  target_link_libraries(mc_mujoco_lib PRIVATE cppzmq)
+elseif(TARGET cppzmq-static)
+  target_link_libraries(mc_mujoco_lib PRIVATE cppzmq-static)
+endif()
+if(TARGET msgpack-cxx)
+  target_link_libraries(mc_mujoco_lib PRIVATE msgpack-cxx)
+elseif(TARGET msgpackc-cxx)
+  target_link_libraries(mc_mujoco_lib PRIVATE msgpackc-cxx)
+endif()
+
 if(NOT COMBINED_MC_MUJOCO_LIB)
   set_target_properties(mc_mujoco_lib PROPERTIES EXPORT_NAME mc_mujoco)
 endif()
 
 add_executable(mc_mujoco main.cpp)
-target_compile_definitions(mc_mujoco PUBLIC MUJOCO_BIN_DIR="${MUJOCO_BIN_DIR}")
 target_link_libraries(mc_mujoco PRIVATE mc_mujoco_lib CLI11::CLI11)
 
 install(
