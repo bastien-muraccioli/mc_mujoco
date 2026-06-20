@@ -1,3 +1,0 @@
-MainRobot: JVRC1
-Enabled: [Posture, EndEffector, CoM, SampleNeckPolicy]
-Timestep: 0.002
