@@ -32,6 +32,7 @@ endif()
 
 set(mc_mujoco_lib_SRC
     mj_configuration.h
+    mj_filters.h
     mj_sim.cpp
     mj_utils.cpp
     mj_utils_merge_mujoco_models.cpp

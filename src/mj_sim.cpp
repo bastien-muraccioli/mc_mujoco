@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <type_traits>
 #include <unordered_set>
 
@@ -432,6 +433,10 @@ void MjRobot::reset(const mc_rbdyn::Robot & robot)
   alphas = std::vector<double>(rjo.size(), 0.0);
   torques = std::vector<double>(rjo.size(), 0.0);
   tau_ext = Eigen::VectorXd::Zero(robot.mb().nrDof());
+  tau_ext_hp_filtered = std::vector<double>(rjo.size(), 0.0);
+  hp_filter_ext_torques_filters.assign(rjo.size(), ButterworthHP2{});
+  // Force (re-)configuration of the filters on the next updateSensors() call
+  hp_filter_ext_torques_configured_cutoff = -1.0;
   for(const auto & mj_jn : mj_jnt_names)
   {
     const auto & jn = [&]()
@@ -817,6 +822,62 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
     encoders[mj_jnt_to_rjo[i]] = data->qpos[model->jnt_qposadr[mj_jnt_ids[i]]];
     alphas[mj_jnt_to_rjo[i]] = data->qvel[model->jnt_dofadr[mj_jnt_ids[i]]];
     torques[mj_jnt_to_rjo[i]] = data->qfrc_actuator[model->jnt_dofadr[mj_jnt_ids[i]]];
+  }
+
+  // High-pass filter on the per-joint external torque (qfrc_constraint + qfrc_passive), injected
+  // directly into MuJoCo's joint-space generalized force (qfrc_applied). This is a pure-physics
+  // feature (it does not require an mc-rtc controller): qfrc_applied is summed directly into the
+  // equations of motion by mj_step, in addition to whatever qfrc_actuator produces, so it takes
+  // effect no matter if the corresponding actuator is currently torque- or position-controlled.
+  // It only lets through the high-frequency content of the external torque (e.g. a contact/impact
+  // transient such as a heel-strike while walking); with the default negative gain, this acts as a
+  // friction/impact compensation term (it opposes/cancels the transient).
+  if(use_hp_filter_ext_torques)
+  {
+    const double dt = model->opt.timestep;
+    const double sample_hz = (dt > 0.0) ? (1.0 / dt) : 1000.0;
+
+    // (Re-)size and (re-)configure the filters if needed (joint count or GUI-driven cutoff change)
+    if(hp_filter_ext_torques_filters.size() != encoders.size())
+    {
+      hp_filter_ext_torques_filters.assign(encoders.size(), ButterworthHP2{});
+      tau_ext_hp_filtered.assign(encoders.size(), 0.0);
+      hp_filter_ext_torques_configured_cutoff = -1.0;
+    }
+    if(hp_filter_ext_torques_configured_cutoff != hp_filter_ext_torques_cutoff)
+    {
+      for(auto & f : hp_filter_ext_torques_filters)
+      {
+        f.configure(hp_filter_ext_torques_cutoff, sample_hz);
+        f.reset();
+      }
+      hp_filter_ext_torques_configured_cutoff = hp_filter_ext_torques_cutoff;
+    }
+
+    for(size_t i = 0; i < mj_jnt_ids.size(); ++i)
+    {
+      int rjo_id = mj_jnt_to_rjo[i];
+      if(rjo_id == -1)
+      {
+        continue;
+      }
+      int dof_addr = model->jnt_dofadr[mj_jnt_ids[i]];
+      double raw_ext_tau = data->qfrc_constraint[dof_addr] + data->qfrc_passive[dof_addr];
+      double filtered = hp_filter_ext_torques_filters[rjo_id].update(raw_ext_tau);
+      tau_ext_hp_filtered[rjo_id] = filtered;
+      // Cleared once per simulation step in MjSimImpl::simStep(), right after mj_step, so this
+      // contribution only lasts for the single next physics step (recomputed every step).
+      data->qfrc_applied[dof_addr] += hp_filter_ext_torques_gain * filtered;
+    }
+  }
+  else if(!hp_filter_ext_torques_filters.empty())
+  {
+    // Keep the filters at rest while disabled so re-enabling later does not replay old transients
+    for(auto & f : hp_filter_ext_torques_filters)
+    {
+      f.reset();
+    }
+    std::fill(tau_ext_hp_filtered.begin(), tau_ext_hp_filtered.end(), 0.0);
   }
 
   if(!gc)
@@ -1361,6 +1422,34 @@ bool MjSimImpl::render()
           ImGui::SameLine();
           ImGui::Text("||tau_ext|| = %.4f", r.tau_ext.norm());
         }
+      }
+
+      ImGui::Separator();
+      ImGui::Text("External torques high-pass filter (friction/impact compensation)");
+      for(auto & r : robots)
+      {
+        ImGui::PushID(r.name.c_str());
+        ImGui::Checkbox(fmt::format("Enable HP filter for {}", r.name).c_str(), &r.use_hp_filter_ext_torques);
+        if(r.use_hp_filter_ext_torques)
+        {
+          float cutoff = static_cast<float>(r.hp_filter_ext_torques_cutoff);
+          if(ImGui::SliderFloat("Cutoff (Hz)", &cutoff, 0.1f, 100.0f, "%.1f"))
+          {
+            r.hp_filter_ext_torques_cutoff = static_cast<double>(cutoff);
+          }
+          bool compensate = r.hp_filter_ext_torques_gain < 0.0;
+          if(ImGui::Checkbox("Compensate (subtract filtered torque)", &compensate))
+          {
+            r.hp_filter_ext_torques_gain = compensate ? -1.0 : 1.0;
+          }
+          double norm = 0.0;
+          for(double v : r.tau_ext_hp_filtered)
+          {
+            norm += v * v;
+          }
+          ImGui::Text("||tau_ext_hp|| = %.4f", std::sqrt(norm));
+        }
+        ImGui::PopID();
       }
     }
     ImGui::End();

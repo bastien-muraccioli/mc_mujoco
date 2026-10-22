@@ -2,6 +2,8 @@
 
 #include "mj_sim.h"
 
+#include "mj_filters.h"
+
 #include "MujocoClient.h"
 
 #include "mujoco.h"
@@ -94,6 +96,34 @@ struct MjRobot
   bool is_external_torques_enabled_changed = false;
   /** External torques (qfrc_constraint) in robot mbc layout */
   Eigen::VectorXd tau_ext;
+
+  /** Whether to high-pass filter the per-joint external torque (qfrc_constraint + qfrc_passive)
+   * and inject it directly into MuJoCo's joint-space generalized force (qfrc_applied).
+   *
+   * Since qfrc_applied is summed directly into the equations of motion by mj_step,
+   * bypassing the actuators entirely, this is effective no matter which control mode
+   * (torque or position) the corresponding actuator is currently using.
+   *
+   * The filter only lets through the high-frequency content of the external torque
+   * (e.g. a contact/impact transient such as a heel-strike while walking), while the
+   * slowly-varying/steady-state part of the contact load is rejected. With a negative
+   * \ref hp_filter_ext_torques_gain (the default), the filtered torque is subtracted,
+   * i.e. it acts as a friction/impact *compensation* term. */
+  bool use_hp_filter_ext_torques = false;
+  /** Cutoff (-3dB) frequency of the external torque high-pass filter [Hz] */
+  double hp_filter_ext_torques_cutoff = 5.0;
+  /** Gain applied to the filtered torque before summing it into qfrc_applied.
+   * Use a negative value (default) to *compensate* (cancel) the high-frequency
+   * external torque, or a positive value to reinforce/add it instead. */
+  double hp_filter_ext_torques_gain = -1.0;
+  /** Cutoff frequency the filters below were last configured with (used to detect
+   * live changes made from the GUI and re-configure/reset the filters accordingly) */
+  double hp_filter_ext_torques_configured_cutoff = -1.0;
+  /** One 2nd-order Butterworth high-pass filter per actuated joint (indexed like \ref torques) */
+  std::vector<ButterworthHP2> hp_filter_ext_torques_filters;
+  /** Filtered (high-frequency only) external torque, indexed like \ref torques, kept for GUI/logging */
+  std::vector<double> tau_ext_hp_filtered;
+
   /** Force sensors reading */
   std::map<std::string, sva::ForceVecd> wrenches;
   /** Gyro readings */
