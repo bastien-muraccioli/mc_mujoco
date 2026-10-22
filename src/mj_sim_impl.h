@@ -89,6 +89,12 @@ struct MjRobot
   std::vector<double> alphas;
   /** Joints' torque in robot.ref_joint_order */
   std::vector<double> torques;
+  /** Whether to feed external torques (qfrc_constraint) back to mc-rtc */
+  bool use_external_torques = false;
+  bool is_external_torques_enabled_changed = false;
+  /** External torques (qfrc_constraint) in robot mbc layout */
+  Eigen::VectorXd tau_ext;
+
   /** Force sensors reading */
   std::map<std::string, sva::ForceVecd> wrenches;
   /** Gyro readings */
@@ -118,6 +124,12 @@ struct MjRobot
   std::vector<std::string> mj_vel_act_names;
   /** Corresppondance from velocity actuator to id inside MuJoCo */
   std::vector<int> mj_vel_act_ids;
+  /** Name of a tendon-driven general actuator used for a gripper compatibility path */
+  std::string mj_general_act_name;
+  /** Correspondance from the general actuator name to id inside MuJoCo */
+  int mj_general_act_id = -1;
+  /** Joint-control index used to generate the command for the general actuator */
+  int mj_general_act_ctrl_idx = -1;
   /** Names of the joints inside MuJoCo */
   std::vector<std::string> mj_jnt_names;
   /** Correspondance from joint name to id inside MuJoCo */
@@ -135,6 +147,8 @@ struct MjRobot
 
   /** Transform from index in mj_mot_names to index in mbc, -1 if not in mbc */
   std::vector<int> mj_to_mbc;
+  /** True when the corresponding controlled joint is an active gripper joint */
+  std::vector<bool> mj_is_gripper_joint;
   /** Command send to mujoco */
   std::vector<double> mj_ctrl;
   /** Previous position desired by mc_rtc */
