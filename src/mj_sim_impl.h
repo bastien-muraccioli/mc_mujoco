@@ -99,6 +99,8 @@ struct MjRobot
   std::map<std::string, sva::ForceVecd> wrenches;
   /** Gyro readings */
   std::map<std::string, Eigen::Vector3d> gyros;
+  mc_control::MCGlobalController::QuaternionMap imu_oris;
+  std::map<std::string, Eigen::Vector3d> imu_poss;
   /** Accelerometer readings */
   std::map<std::string, Eigen::Vector3d> accelerometers;
 
