@@ -895,11 +895,12 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
     root_ori.x() = data->qpos[root_qpos_idx + 4];
     root_ori.y() = data->qpos[root_qpos_idx + 5];
     root_ori.z() = data->qpos[root_qpos_idx + 6];
-    root_ori = root_ori.inverse();
-    root_linvel = Eigen::Map<Eigen::Vector3d>(&data->qvel[root_qvel_idx]);
-    root_angvel = Eigen::Map<Eigen::Vector3d>(&data->qvel[root_qvel_idx + 3]);
-    root_linacc = Eigen::Map<Eigen::Vector3d>(&data->qacc[root_qvel_idx]);
-    root_angacc = Eigen::Map<Eigen::Vector3d>(&data->qacc[root_qvel_idx + 3]);
+    const Eigen::Matrix3d R_0_b = root_ori.toRotationMatrix(); // MuJoCo quat = R_0_b
+    root_ori = root_ori.inverse(); // keep: mc_rtc wants R^T
+    root_linvel = Eigen::Map<Eigen::Vector3d>(&data->qvel[root_qvel_idx]); // world, OK
+    root_angvel = R_0_b * Eigen::Map<Eigen::Vector3d>(&data->qvel[root_qvel_idx + 3]); // body -> world
+    root_angacc = R_0_b * Eigen::Map<Eigen::Vector3d>(&data->qacc[root_qvel_idx + 3]); // body -> world
+    root_linacc = Eigen::Map<Eigen::Vector3d>(&data->qacc[root_qvel_idx]) - root_angvel.cross(root_linvel);
     if(robot.hasBodySensor("FloatingBase"))
     {
       gc->setSensorPositions(name, {{"FloatingBase", root_pos}});
@@ -915,8 +916,19 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
   for(auto & gyro : gyros)
   {
     mujoco_get_sensordata(*model, *data, mc_bs_to_mj_gyro_id[gyro.first], gyro.second.data());
+    int sid = mc_bs_to_mj_gyro_id[gyro.first];
+    if(sid < 0 || model->sensor_objtype[sid] != mjOBJ_SITE)
+    {
+      continue;
+    }
+    int site = model->sensor_objid[sid];
+    Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> R_0_s(data->site_xmat + 9 * site);
+    imu_oris[gyro.first] = Eigen::Quaterniond(R_0_s.transpose()); // mc_rtc wants R^T
+    imu_poss[gyro.first] = Eigen::Map<const Eigen::Vector3d>(data->site_xpos + 3 * site); // world frame
   }
   gc->setSensorAngularVelocities(name, gyros);
+  gc->setSensorOrientations(name, imu_oris);
+  gc->setSensorPositions(name, imu_poss);
 
   // Accelerometers update
   for(auto & accelerometer : accelerometers)
@@ -956,14 +968,12 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
       tau_ext_mbc[j].assign(mb.joint(j).dof(), 0.0);
     }
 
-    // Floating base: MuJoCo free joint DoF layout is [vx, vy, vz, wx, wy, wz] (linear then angular)
-    // RBDyn Free joint DoF layout is [wx, wy, wz, vx, vy, vz] (angular then linear)
-    // Both are in world frame so only a reordering is needed, no rotation
+    // Floating base: MuJoCo free joint qfrc layout is [f (world frame), m (base frame, about base origin)]
+    // RBDyn Free joint expects [m; f], both in base frame, about base origin
+    // -> reorder, and rotate f from world to base frame
     if(root_qvel_idx != -1 && root_joint_type == mjJNT_FREE && mb.joint(0).dof() == 6)
     {
-      // MuJoCo indices: linear=[0,1,2], angular=[3,4,5]
-      // RBDyn indices:  angular=[0,1,2], linear=[3,4,5]
-      // Total external/passive force acting on the free joint (in world frame)
+      // Total external/passive generalized force on the free joint: f in world frame, m in base frame)
       double fx = data->qfrc_constraint[root_qvel_idx + 0] + data->qfrc_passive[root_qvel_idx + 0];
       double fy = data->qfrc_constraint[root_qvel_idx + 1] + data->qfrc_passive[root_qvel_idx + 1];
       double fz = data->qfrc_constraint[root_qvel_idx + 2] + data->qfrc_passive[root_qvel_idx + 2];
@@ -972,13 +982,11 @@ void MjRobot::updateSensors(mc_control::MCGlobalController * gc, mjModel * model
       double wy = data->qfrc_constraint[root_qvel_idx + 4] + data->qfrc_passive[root_qvel_idx + 4];
       double wz = data->qfrc_constraint[root_qvel_idx + 5] + data->qfrc_passive[root_qvel_idx + 5];
 
-      // Assign to RBDyn world-frame spatial force vector format [Angular, Linear]
-      tau_ext_mbc[0][0] = wx;
-      tau_ext_mbc[0][1] = wy;
-      tau_ext_mbc[0][2] = wz;
-      tau_ext_mbc[0][3] = fx;
-      tau_ext_mbc[0][4] = fy;
-      tau_ext_mbc[0][5] = fz;
+      // RBDyn base-frame generalized force [moment; force]
+      Eigen::Vector3d f_w(fx, fy, fz);
+      const Eigen::Matrix3d R_0_b = root_ori.conjugate().toRotationMatrix(); // undo the inverse
+      Eigen::Vector3d f_b = R_0_b.transpose() * f_w; // world -> base
+      tau_ext_mbc[0] = {wx, wy, wz, f_b.x(), f_b.y(), f_b.z()};
     }
 
     // 1-DoF actuated joints
