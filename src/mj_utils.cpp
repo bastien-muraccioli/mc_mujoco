@@ -333,6 +333,30 @@ bool mujoco_init(MjSimImpl * mj_sim,
     return false;
   }
 
+  // Keep GUI scales (perturb arrow, contact forces, selection point) robot-sized:
+  // ignore static scenery (bodies welded to world, e.g. terrain_course)
+  {
+    mjModel * m = mj_sim->model;
+    double mass = 0, size = 0;
+    int n = 0;
+    for(int b = 1; b < m->nbody; ++b)
+    {
+      if(m->body_weldid[b] == 0 || m->body_mass[b] < mjMINVAL)
+      {
+        continue;
+      }
+      const double * I = m->body_inertia + 3 * b;
+      mass += m->body_mass[b];
+      size += std::sqrt((I[0] + I[1] + I[2]) / m->body_mass[b]);
+      ++n;
+    }
+    if(n > 0)
+    {
+      m->stat.meanmass = mass / n;
+      m->stat.meansize = size / n;
+    }
+  }
+
   // make data
   mj_sim->data = mj_makeData(mj_sim->model);
 
